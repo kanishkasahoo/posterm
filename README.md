@@ -2,26 +2,51 @@
 
 Terminal-based HTTP client built with Rust + Ratatui.
 
-## Prerequisites
+## Install from Releases
+
+CI publishes installable artifacts on GitHub Releases for supported platforms:
+
+- Linux: `.tar.gz`
+- macOS: `.tar.gz` and `.pkg`
+- Windows: `.zip` and `.msi`
+
+Download the artifact for your OS from the repo's **Releases** page, then install/run:
+
+- Linux/macOS `.tar.gz`: extract and run the `posterm` binary
+- macOS `.pkg`: open the package and follow the installer
+- Windows `.zip`: extract and run `posterm.exe`
+- Windows `.msi`: run the installer and launch from Start Menu/terminal
+
+## Build from source
+
+Prerequisites:
 
 - Rust toolchain (stable) with `cargo` installed
 - A terminal that supports TUI applications
 
-You can install Rust with:
+Install Rust (if needed):
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-## Installation
-
-From the project root:
+From the project root, build the app:
 
 ```bash
 cargo build
 ```
 
-This fetches dependencies and compiles the app.
+Run in development mode:
+
+```bash
+cargo run
+```
+
+Run optimized mode:
+
+```bash
+cargo run --release
+```
 
 ## Configuration and History
 
@@ -115,20 +140,6 @@ Persistence/retention details:
 Optional environment variable:
 
 - `POSTERM_ALLOW_INSECURE_TLS=1` allows selecting intentionally insecure TLS mode in request execution
-
-## Running locally
-
-Start the app in development mode:
-
-```bash
-cargo run
-```
-
-Run optimized build:
-
-```bash
-cargo run --release
-```
 
 ## Useful scripts
 
