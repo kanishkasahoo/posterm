@@ -1,57 +1,101 @@
 use std::time::Duration;
 
+use base64::Engine;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::layout::{Constraint, Layout};
+use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
 
-use crate::action::Action;
+use crate::action::{Action, BodyContent};
 use crate::components::Component;
+use crate::components::help_modal;
 use crate::components::layout_manager::LayoutManager;
 use crate::components::request_builder::RequestBuilder;
+use crate::components::response_viewer::ResponseViewer;
+use crate::components::response_viewer::raw_view::raw_lines;
+use crate::components::response_viewer::response_body::body_search_lines;
+use crate::components::response_viewer::response_headers::header_lines;
 use crate::components::status_bar::StatusBar;
 use crate::event::{Event, EventHandler};
+use crate::http::client::HttpClientPool;
+use crate::http::execute_request;
 use crate::state::{
-    AppState, KeyValueEditorState, KeyValueField, KeyValueRow, MAX_HEADER_ROWS, MAX_KEY_LENGTH,
-    MAX_QUERY_PARAM_ROWS, MAX_URL_LENGTH, MAX_VALUE_LENGTH, QueryParamToken, RequestTab,
-    SyncDirection,
+    AppState, AuthField, AuthMode, BodyField, BodyFormat, InFlightRequest, KeyValueEditorState,
+    KeyValueField, KeyValueRow, MAX_AUTH_PASSWORD_LENGTH, MAX_AUTH_TOKEN_LENGTH,
+    MAX_AUTH_USERNAME_LENGTH, MAX_BODY_FORM_ROWS, MAX_BODY_TEXT_LENGTH, MAX_HEADER_ROWS,
+    MAX_KEY_LENGTH, MAX_QUERY_PARAM_ROWS, MAX_URL_LENGTH, MAX_VALUE_LENGTH, QueryParamToken,
+    RequestTab, ResponseSearchScope, ResponseTab, SearchMatch, SyncDirection,
 };
 use crate::tui::Tui;
+use crate::util::terminal_sanitize::sanitize_terminal_text;
 use crate::util::url_parser::{parse_query_params, rebuild_url_with_params};
 
 pub struct App {
     state: AppState,
     events: EventHandler,
     request_builder: RequestBuilder,
+    response_viewer: ResponseViewer,
     status_bar: StatusBar,
+    http_pool: HttpClientPool,
+    action_sender: mpsc::Sender<Action>,
+    action_receiver: mpsc::Receiver<Action>,
+    request_task: Option<JoinHandle<()>>,
+    request_cancel_sender: Option<watch::Sender<bool>>,
+    next_request_id: u64,
+    pending_response_search_bytes: usize,
 }
+
+const MAX_RESPONSE_SEARCH_QUERY_CHARS: usize = 256;
+const MAX_RESPONSE_SEARCH_MATCHES: usize = 10_000;
+const RESPONSE_SEARCH_RECOMPUTE_CHUNK_BYTES: usize = 8 * 1024;
 
 impl App {
     pub fn new(initial_size: (u16, u16)) -> Self {
         let layout_mode = LayoutManager::mode_for_dimensions(initial_size.0, initial_size.1);
         let state = AppState::new(initial_size, layout_mode);
+        let (action_sender, action_receiver) = mpsc::channel(256);
 
         Self {
             state,
             events: EventHandler::new(Duration::from_millis(250), Duration::from_millis(33)),
             request_builder: RequestBuilder,
+            response_viewer: ResponseViewer,
             status_bar: StatusBar,
+            http_pool: HttpClientPool::new().expect("failed to initialize HTTP client pool"),
+            action_sender,
+            action_receiver,
+            request_task: None,
+            request_cancel_sender: None,
+            next_request_id: 1,
+            pending_response_search_bytes: 0,
         }
     }
 
     pub async fn run(&mut self, tui: &mut Tui) -> std::io::Result<()> {
         self.render(tui)?;
 
-        while let Some(event) = self.events.next().await {
-            let actions = self.map_event_to_actions(event);
-
-            for action in actions {
-                self.apply_action(action.clone());
-                self.request_builder.handle_action(&action, &self.state);
-                self.status_bar.handle_action(&action, &self.state);
-
-                if matches!(action, Action::Render) {
-                    self.render(tui)?;
+        loop {
+            let events = &mut self.events;
+            let action_receiver = &mut self.action_receiver;
+            let next_actions = tokio::select! {
+                maybe_event = events.next() => {
+                    match maybe_event {
+                        Some(event) => self.map_event_to_actions(event),
+                        None => break,
+                    }
                 }
+                maybe_action = action_receiver.recv() => {
+                    match maybe_action {
+                        Some(action) => vec![action, Action::Render],
+                        None => Vec::new(),
+                    }
+                }
+            };
 
+            for action in next_actions {
+                self.process_action(action, tui)?;
                 if self.state.should_quit {
+                    self.cancel_in_flight_request();
                     return Ok(());
                 }
             }
@@ -60,13 +104,52 @@ impl App {
         Ok(())
     }
 
+    fn process_action(&mut self, action: Action, tui: &mut Tui) -> std::io::Result<()> {
+        self.apply_action(action.clone());
+        self.request_builder.handle_action(&action, &self.state);
+        self.response_viewer.handle_action(&action, &self.state);
+        self.status_bar.handle_action(&action, &self.state);
+
+        if matches!(action, Action::Render) {
+            self.render(tui)?;
+        }
+
+        Ok(())
+    }
+
     fn render(&mut self, tui: &mut Tui) -> std::io::Result<()> {
         tui.draw(|frame| {
             let pane_layout = LayoutManager::compute(frame.area());
+
+            const MIN_REQUEST_PANE_WIDTH: u16 = 56;
+            const MIN_RESPONSE_PANE_WIDTH: u16 = 72;
+            const HORIZONTAL_MIN_WIDTH: u16 = MIN_REQUEST_PANE_WIDTH + MIN_RESPONSE_PANE_WIDTH;
+
+            let use_horizontal_split =
+                !matches!(self.state.layout_mode, crate::state::LayoutMode::Small)
+                    && pane_layout.main.width >= HORIZONTAL_MIN_WIDTH;
+
+            let main_chunks = if use_horizontal_split {
+                Layout::horizontal([
+                    Constraint::Min(MIN_REQUEST_PANE_WIDTH),
+                    Constraint::Min(MIN_RESPONSE_PANE_WIDTH),
+                ])
+                .split(pane_layout.main)
+            } else {
+                Layout::vertical([Constraint::Percentage(52), Constraint::Percentage(48)])
+                    .split(pane_layout.main)
+            };
+
             self.request_builder
-                .render(frame, pane_layout.main, &self.state);
+                .render(frame, main_chunks[0], &self.state);
+            self.response_viewer
+                .render(frame, main_chunks[1], &self.state);
             self.status_bar
                 .render(frame, pane_layout.status, &self.state);
+
+            if self.state.help_visible {
+                help_modal::render(frame, pane_layout.main, &self.state);
+            }
         })
     }
 
@@ -80,9 +163,40 @@ impl App {
     }
 
     fn map_key_event_to_actions(&mut self, key_event: KeyEvent) -> Vec<Action> {
+        if self.state.help_visible {
+            if Self::is_help_shortcut(key_event) {
+                return vec![Action::ToggleHelp, Action::Render];
+            }
+            if key_event.code == KeyCode::Esc {
+                return vec![Action::CloseHelp, Action::Render];
+            }
+            return Vec::new();
+        }
+
+        if self.state.response.search.active {
+            let actions = self.handle_active_response_search_keys(key_event);
+            if !actions.is_empty() {
+                return actions;
+            }
+        }
+
+        if Self::is_help_shortcut(key_event) {
+            return vec![Action::ToggleHelp, Action::Render];
+        }
+
+        if Self::is_response_search_shortcut(key_event) {
+            return vec![Action::OpenResponseSearch, Action::Render];
+        }
+
         match (key_event.code, key_event.modifiers) {
             (KeyCode::Char('q'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
                 return vec![Action::Quit];
+            }
+            (KeyCode::Char('s'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                return vec![Action::SendRequest, Action::Render];
+            }
+            (KeyCode::Char('c'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                return vec![Action::CancelRequest, Action::Render];
             }
             (KeyCode::Tab, _) => {
                 return vec![Action::FocusNext, Action::Render];
@@ -90,7 +204,15 @@ impl App {
             (KeyCode::BackTab, _) => {
                 return vec![Action::FocusPrev, Action::Render];
             }
+            (KeyCode::Esc, _) if self.state.response.search.active => {
+                return vec![Action::CloseResponseSearch, Action::Render];
+            }
             _ => {}
+        }
+
+        let response_actions = self.handle_response_navigation_keys(key_event);
+        if !response_actions.is_empty() {
+            return response_actions;
         }
 
         let mut actions = match self.state.request.focus {
@@ -105,6 +227,85 @@ impl App {
         }
 
         actions
+    }
+
+    fn is_help_shortcut(key_event: KeyEvent) -> bool {
+        key_event.code == KeyCode::F(1)
+    }
+
+    fn is_response_search_shortcut(key_event: KeyEvent) -> bool {
+        key_event.code == KeyCode::Char('f') && key_event.modifiers.contains(KeyModifiers::CONTROL)
+    }
+
+    fn handle_active_response_search_keys(&self, key_event: KeyEvent) -> Vec<Action> {
+        match key_event.code {
+            KeyCode::Esc => vec![Action::CloseResponseSearch, Action::Render],
+            KeyCode::Enter | KeyCode::Char('n') => vec![Action::NextSearchMatch, Action::Render],
+            KeyCode::Char('N') => vec![Action::PrevSearchMatch, Action::Render],
+            KeyCode::Backspace => {
+                let mut query = self.state.response.search.query.clone();
+                query.pop();
+                vec![Action::SearchInResponse(query), Action::Render]
+            }
+            KeyCode::Char(ch) if !key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                let mut query = self.state.response.search.query.clone();
+                query.push(ch);
+                vec![Action::SearchInResponse(query), Action::Render]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn handle_response_navigation_keys(&self, key_event: KeyEvent) -> Vec<Action> {
+        match (key_event.code, key_event.modifiers) {
+            (KeyCode::Char('h'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                vec![
+                    Action::SetResponseTab(self.state.response.active_tab.prev()),
+                    Action::Render,
+                ]
+            }
+            (KeyCode::Char('l'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                vec![
+                    Action::SetResponseTab(self.state.response.active_tab.next()),
+                    Action::Render,
+                ]
+            }
+            (KeyCode::Char('1'), modifiers) if modifiers.contains(KeyModifiers::ALT) => {
+                vec![Action::SetResponseTab(ResponseTab::Body), Action::Render]
+            }
+            (KeyCode::Char('2'), modifiers) if modifiers.contains(KeyModifiers::ALT) => {
+                vec![Action::SetResponseTab(ResponseTab::Headers), Action::Render]
+            }
+            (KeyCode::Char('3'), modifiers) if modifiers.contains(KeyModifiers::ALT) => {
+                vec![Action::SetResponseTab(ResponseTab::Raw), Action::Render]
+            }
+            (KeyCode::Up, modifiers)
+                if modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT) =>
+            {
+                vec![Action::ScrollResponse(-1), Action::Render]
+            }
+            (KeyCode::Down, modifiers)
+                if modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT) =>
+            {
+                vec![Action::ScrollResponse(1), Action::Render]
+            }
+            (KeyCode::PageUp, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                vec![Action::ScrollResponse(-10), Action::Render]
+            }
+            (KeyCode::PageDown, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                vec![Action::ScrollResponse(10), Action::Render]
+            }
+            (KeyCode::Left, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                vec![Action::ScrollResponseHorizontal(-4), Action::Render]
+            }
+            (KeyCode::Right, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                vec![Action::ScrollResponseHorizontal(4), Action::Render]
+            }
+            (KeyCode::Char('w'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                vec![Action::ToggleResponseWrap, Action::Render]
+            }
+            _ => Vec::new(),
+        }
     }
 
     fn handle_method_key(&self, key_event: KeyEvent) -> Vec<Action> {
@@ -212,8 +413,243 @@ impl App {
         match self.state.request.active_tab {
             RequestTab::Params => self.handle_kv_editor_key(key_event, true),
             RequestTab::Headers => self.handle_kv_editor_key(key_event, false),
-            RequestTab::Auth | RequestTab::Body => Vec::new(),
+            RequestTab::Auth => self.handle_auth_editor_key(key_event),
+            RequestTab::Body => self.handle_body_editor_key(key_event),
         }
+    }
+
+    fn handle_auth_editor_key(&mut self, key_event: KeyEvent) -> Vec<Action> {
+        let mut actions = Vec::new();
+        let active = self.state.request.auth_editor.active_field;
+
+        match key_event.code {
+            KeyCode::Up => {
+                self.state.request.auth_editor.active_field =
+                    prev_auth_field(active, self.state.request.auth_mode);
+            }
+            KeyCode::Down => {
+                self.state.request.auth_editor.active_field =
+                    next_auth_field(active, self.state.request.auth_mode);
+            }
+            KeyCode::Left => {
+                if active == AuthField::Mode {
+                    actions.push(Action::SetAuthMode(self.state.request.auth_mode.prev()));
+                } else {
+                    let cursor = self.auth_cursor_mut(active);
+                    *cursor = cursor.saturating_sub(1);
+                }
+            }
+            KeyCode::Right => {
+                if active == AuthField::Mode {
+                    actions.push(Action::SetAuthMode(self.state.request.auth_mode.next()));
+                } else {
+                    let len = self.auth_field_len(active);
+                    let cursor = self.auth_cursor_mut(active);
+                    *cursor = (*cursor + 1).min(len);
+                }
+            }
+            KeyCode::Home => {
+                if active != AuthField::Mode {
+                    *self.auth_cursor_mut(active) = 0;
+                }
+            }
+            KeyCode::End => {
+                if active != AuthField::Mode {
+                    *self.auth_cursor_mut(active) = self.auth_field_len(active);
+                }
+            }
+            KeyCode::Backspace => {
+                self.handle_auth_backspace(active, &mut actions);
+            }
+            KeyCode::Delete => {
+                self.handle_auth_delete(active, &mut actions);
+            }
+            KeyCode::Char(ch) if !key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.handle_auth_insert(active, ch, &mut actions);
+            }
+            _ => {}
+        }
+
+        actions
+    }
+
+    fn handle_body_editor_key(&mut self, key_event: KeyEvent) -> Vec<Action> {
+        match self.state.request.body_editor.active_field {
+            BodyField::Form => self.handle_body_form_editor_key(key_event),
+            _ => self.handle_body_non_form_key(key_event),
+        }
+    }
+
+    fn handle_body_non_form_key(&mut self, key_event: KeyEvent) -> Vec<Action> {
+        let mut actions = Vec::new();
+        let active = self.state.request.body_editor.active_field;
+
+        match key_event.code {
+            KeyCode::Up => {
+                self.state.request.body_editor.active_field =
+                    prev_body_field(active, self.state.request.body_format);
+            }
+            KeyCode::Down => {
+                self.state.request.body_editor.active_field =
+                    next_body_field(active, self.state.request.body_format);
+            }
+            KeyCode::Left => {
+                if active == BodyField::Format {
+                    actions.push(Action::SetBodyFormat(self.state.request.body_format.prev()));
+                } else {
+                    self.state.request.body_editor.json_cursor =
+                        self.state.request.body_editor.json_cursor.saturating_sub(1);
+                }
+            }
+            KeyCode::Right => {
+                if active == BodyField::Format {
+                    actions.push(Action::SetBodyFormat(self.state.request.body_format.next()));
+                } else {
+                    let max = self.state.request.body_json.chars().count();
+                    self.state.request.body_editor.json_cursor =
+                        (self.state.request.body_editor.json_cursor + 1).min(max);
+                }
+            }
+            KeyCode::Home => {
+                if active == BodyField::Json {
+                    let cursor = self.state.request.body_editor.json_cursor;
+                    self.state.request.body_editor.json_cursor =
+                        line_start_index(&self.state.request.body_json, cursor);
+                }
+            }
+            KeyCode::End => {
+                if active == BodyField::Json {
+                    let cursor = self.state.request.body_editor.json_cursor;
+                    self.state.request.body_editor.json_cursor =
+                        line_end_index(&self.state.request.body_json, cursor);
+                }
+            }
+            KeyCode::Enter => {
+                if active == BodyField::Json {
+                    self.handle_json_insert_char('\n', &mut actions);
+                }
+            }
+            KeyCode::Backspace => {
+                if active == BodyField::Json {
+                    self.handle_json_backspace(&mut actions);
+                }
+            }
+            KeyCode::Delete => {
+                if active == BodyField::Json {
+                    self.handle_json_delete(&mut actions);
+                }
+            }
+            KeyCode::Char(ch) if !key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                if active == BodyField::Json {
+                    self.handle_json_insert_char(ch, &mut actions);
+                }
+            }
+            _ => {}
+        }
+
+        actions
+    }
+
+    fn handle_body_form_editor_key(&mut self, key_event: KeyEvent) -> Vec<Action> {
+        if key_event.code == KeyCode::Up
+            && self.state.request.body_editor.form_editor.selected_row == 0
+        {
+            self.state.request.body_editor.active_field = BodyField::Format;
+            return Vec::new();
+        }
+
+        let rows_len = self.state.request.body_form.len();
+        let mut editor = self.state.request.body_editor.form_editor;
+
+        if rows_len == 0 {
+            editor.selected_row = 0;
+            editor.cursor = 0;
+        } else if editor.selected_row >= rows_len {
+            editor.selected_row = rows_len - 1;
+            editor.cursor = 0;
+        }
+
+        let mut actions = Vec::new();
+
+        match key_event.code {
+            KeyCode::Up => {
+                if editor.selected_row > 0 {
+                    editor.selected_row -= 1;
+                    editor.cursor = 0;
+                }
+            }
+            KeyCode::Down => {
+                if rows_len > 0 {
+                    editor.selected_row = (editor.selected_row + 1).min(rows_len - 1);
+                    editor.cursor = 0;
+                }
+            }
+            KeyCode::Left => {
+                editor.cursor = editor.cursor.saturating_sub(1);
+            }
+            KeyCode::Right => {
+                editor.cursor = (editor.cursor + 1).min(self.form_editor_field_len(editor));
+            }
+            KeyCode::Home => {
+                editor.cursor = 0;
+            }
+            KeyCode::End => {
+                editor.cursor = self.form_editor_field_len(editor);
+            }
+            KeyCode::Enter => {
+                editor.active_field = editor.active_field.toggle();
+                editor.cursor = self.form_editor_field_len(editor).min(editor.cursor);
+            }
+            KeyCode::Char('n') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                if rows_len < MAX_BODY_FORM_ROWS {
+                    actions.push(Action::SetBodyContent(BodyContent::AddFormRow));
+                    editor.selected_row = rows_len;
+                    editor.active_field = KeyValueField::Key;
+                    editor.cursor = 0;
+                }
+            }
+            KeyCode::Char('d') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                if rows_len > 0 {
+                    actions.push(Action::SetBodyContent(BodyContent::RemoveFormRow(
+                        editor.selected_row,
+                    )));
+                    if editor.selected_row > 0 {
+                        editor.selected_row -= 1;
+                    }
+                    editor.cursor = 0;
+                }
+            }
+            KeyCode::Char(' ') => {
+                if let Some(row) = self
+                    .state
+                    .request
+                    .body_form
+                    .get(editor.selected_row)
+                    .cloned()
+                {
+                    actions.push(Action::SetBodyContent(BodyContent::SetFormRow {
+                        index: editor.selected_row,
+                        row: KeyValueRow {
+                            enabled: !row.enabled,
+                            ..row
+                        },
+                    }));
+                }
+            }
+            KeyCode::Backspace => {
+                self.handle_form_backspace(&mut editor, &mut actions);
+            }
+            KeyCode::Delete => {
+                self.handle_form_delete(&mut editor, &mut actions);
+            }
+            KeyCode::Char(ch) if !key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.handle_form_insert(ch, &mut editor, &mut actions);
+            }
+            _ => {}
+        }
+
+        self.state.request.body_editor.form_editor = editor;
+        actions
     }
 
     fn handle_kv_editor_key(&mut self, key_event: KeyEvent, is_params: bool) -> Vec<Action> {
@@ -458,6 +894,306 @@ impl App {
         }
     }
 
+    fn auth_field_len(&self, field: AuthField) -> usize {
+        match field {
+            AuthField::Mode => 0,
+            AuthField::Token => self.state.request.auth_token.chars().count(),
+            AuthField::Username => self.state.request.auth_username.chars().count(),
+            AuthField::Password => self.state.request.auth_password.chars().count(),
+        }
+    }
+
+    fn auth_cursor_mut(&mut self, field: AuthField) -> &mut usize {
+        match field {
+            AuthField::Mode => &mut self.state.request.auth_editor.token_cursor,
+            AuthField::Token => &mut self.state.request.auth_editor.token_cursor,
+            AuthField::Username => &mut self.state.request.auth_editor.username_cursor,
+            AuthField::Password => &mut self.state.request.auth_editor.password_cursor,
+        }
+    }
+
+    fn handle_auth_insert(&mut self, field: AuthField, ch: char, actions: &mut Vec<Action>) {
+        let (value, max_len, cursor) = match field {
+            AuthField::Mode => return,
+            AuthField::Token => (
+                self.state.request.auth_token.clone(),
+                MAX_AUTH_TOKEN_LENGTH,
+                self.state.request.auth_editor.token_cursor,
+            ),
+            AuthField::Username => (
+                self.state.request.auth_username.clone(),
+                MAX_AUTH_USERNAME_LENGTH,
+                self.state.request.auth_editor.username_cursor,
+            ),
+            AuthField::Password => (
+                self.state.request.auth_password.clone(),
+                MAX_AUTH_PASSWORD_LENGTH,
+                self.state.request.auth_editor.password_cursor,
+            ),
+        };
+
+        if value.chars().count() >= max_len {
+            return;
+        }
+
+        let mut updated = value;
+        insert_char(&mut updated, cursor, ch);
+        *self.auth_cursor_mut(field) = cursor + 1;
+        self.push_auth_update_action(actions, field, updated);
+    }
+
+    fn handle_auth_backspace(&mut self, field: AuthField, actions: &mut Vec<Action>) {
+        if field == AuthField::Mode {
+            return;
+        }
+
+        let cursor = *self.auth_cursor_mut(field);
+        if cursor == 0 {
+            return;
+        }
+
+        let mut updated = match field {
+            AuthField::Token => self.state.request.auth_token.clone(),
+            AuthField::Username => self.state.request.auth_username.clone(),
+            AuthField::Password => self.state.request.auth_password.clone(),
+            AuthField::Mode => String::new(),
+        };
+
+        remove_char(&mut updated, cursor - 1);
+        *self.auth_cursor_mut(field) = cursor - 1;
+        self.push_auth_update_action(actions, field, updated);
+    }
+
+    fn handle_auth_delete(&mut self, field: AuthField, actions: &mut Vec<Action>) {
+        if field == AuthField::Mode {
+            return;
+        }
+
+        let cursor = *self.auth_cursor_mut(field);
+        let mut updated = match field {
+            AuthField::Token => self.state.request.auth_token.clone(),
+            AuthField::Username => self.state.request.auth_username.clone(),
+            AuthField::Password => self.state.request.auth_password.clone(),
+            AuthField::Mode => String::new(),
+        };
+
+        if cursor < updated.chars().count() {
+            remove_char(&mut updated, cursor);
+            self.push_auth_update_action(actions, field, updated);
+        }
+    }
+
+    fn push_auth_update_action(
+        &self,
+        actions: &mut Vec<Action>,
+        field: AuthField,
+        updated: String,
+    ) {
+        match field {
+            AuthField::Token => actions.push(Action::SetAuthToken(updated)),
+            AuthField::Username => actions.push(Action::SetAuthCredentials {
+                username: updated,
+                password: self.state.request.auth_password.clone(),
+            }),
+            AuthField::Password => actions.push(Action::SetAuthCredentials {
+                username: self.state.request.auth_username.clone(),
+                password: updated,
+            }),
+            AuthField::Mode => {}
+        }
+    }
+
+    fn handle_json_insert_char(&mut self, ch: char, actions: &mut Vec<Action>) {
+        let cursor = self
+            .state
+            .request
+            .body_editor
+            .json_cursor
+            .min(self.state.request.body_json.chars().count());
+        if self.state.request.body_json.chars().count() >= MAX_BODY_TEXT_LENGTH {
+            return;
+        }
+        let mut updated = self.state.request.body_json.clone();
+        insert_char(&mut updated, cursor, ch);
+        self.state.request.body_editor.json_cursor = cursor + 1;
+        actions.push(Action::SetBodyContent(BodyContent::Json(updated)));
+    }
+
+    fn handle_json_backspace(&mut self, actions: &mut Vec<Action>) {
+        let cursor = self.state.request.body_editor.json_cursor;
+        if cursor == 0 {
+            return;
+        }
+        let mut updated = self.state.request.body_json.clone();
+        remove_char(&mut updated, cursor - 1);
+        self.state.request.body_editor.json_cursor = cursor - 1;
+        actions.push(Action::SetBodyContent(BodyContent::Json(updated)));
+    }
+
+    fn handle_json_delete(&mut self, actions: &mut Vec<Action>) {
+        let cursor = self.state.request.body_editor.json_cursor;
+        let mut updated = self.state.request.body_json.clone();
+        if cursor < updated.chars().count() {
+            remove_char(&mut updated, cursor);
+            actions.push(Action::SetBodyContent(BodyContent::Json(updated)));
+        }
+    }
+
+    fn form_editor_field_len(&self, editor: KeyValueEditorState) -> usize {
+        let Some(row) = self.state.request.body_form.get(editor.selected_row) else {
+            return 0;
+        };
+        match editor.active_field {
+            KeyValueField::Key => row.key.chars().count(),
+            KeyValueField::Value => row.value.chars().count(),
+        }
+    }
+
+    fn handle_form_insert(
+        &self,
+        ch: char,
+        editor: &mut KeyValueEditorState,
+        actions: &mut Vec<Action>,
+    ) {
+        let row = self
+            .state
+            .request
+            .body_form
+            .get(editor.selected_row)
+            .cloned()
+            .unwrap_or_default();
+        let mut updated = row;
+        let field = match editor.active_field {
+            KeyValueField::Key => &mut updated.key,
+            KeyValueField::Value => &mut updated.value,
+        };
+        let max_len = match editor.active_field {
+            KeyValueField::Key => MAX_KEY_LENGTH,
+            KeyValueField::Value => MAX_VALUE_LENGTH,
+        };
+        if field.chars().count() >= max_len {
+            return;
+        }
+        insert_char(field, editor.cursor, ch);
+        editor.cursor += 1;
+        actions.push(Action::SetBodyContent(BodyContent::SetFormRow {
+            index: editor.selected_row,
+            row: updated,
+        }));
+    }
+
+    fn handle_form_backspace(&self, editor: &mut KeyValueEditorState, actions: &mut Vec<Action>) {
+        let Some(row) = self
+            .state
+            .request
+            .body_form
+            .get(editor.selected_row)
+            .cloned()
+        else {
+            return;
+        };
+        if editor.cursor == 0 {
+            return;
+        }
+
+        let mut updated = row;
+        let field = match editor.active_field {
+            KeyValueField::Key => &mut updated.key,
+            KeyValueField::Value => &mut updated.value,
+        };
+        remove_char(field, editor.cursor - 1);
+        editor.cursor -= 1;
+        actions.push(Action::SetBodyContent(BodyContent::SetFormRow {
+            index: editor.selected_row,
+            row: updated,
+        }));
+    }
+
+    fn handle_form_delete(&self, editor: &mut KeyValueEditorState, actions: &mut Vec<Action>) {
+        let Some(row) = self
+            .state
+            .request
+            .body_form
+            .get(editor.selected_row)
+            .cloned()
+        else {
+            return;
+        };
+
+        let mut updated = row;
+        let field = match editor.active_field {
+            KeyValueField::Key => &mut updated.key,
+            KeyValueField::Value => &mut updated.value,
+        };
+
+        if editor.cursor < field.chars().count() {
+            remove_char(field, editor.cursor);
+            actions.push(Action::SetBodyContent(BodyContent::SetFormRow {
+                index: editor.selected_row,
+                row: updated,
+            }));
+        }
+    }
+
+    fn start_request_execution(&mut self) {
+        if self.state.response.in_flight.is_some() || self.request_task.is_some() {
+            self.state.response.last_error = Some(String::from(
+                "A request is already in flight. Press Ctrl+C to cancel it first.",
+            ));
+            return;
+        }
+
+        let effective_url = rebuild_url_with_params(
+            &self.state.request.url,
+            &self.state.request.query_params,
+            &self.state.request.query_param_tokens,
+        );
+        if effective_url.trim().is_empty() {
+            self.state.response.last_error = Some(String::from("Request URL cannot be empty."));
+            return;
+        }
+
+        if reqwest::Url::parse(&effective_url).is_err() {
+            self.state.response.last_error = Some(format!(
+                "Request URL is invalid: {}",
+                sanitize_terminal_text(&effective_url)
+            ));
+            return;
+        }
+
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
+
+        let request_state = self.state.request.clone();
+        let action_sender = self.action_sender.clone();
+        let pool = self.http_pool.clone();
+        let (cancel_sender, mut cancel_receiver) = watch::channel(false);
+
+        self.request_cancel_sender = Some(cancel_sender);
+        self.request_task = Some(tokio::spawn(async move {
+            let _ = execute_request(
+                &pool,
+                &request_state,
+                request_id,
+                false,
+                &mut cancel_receiver,
+                &action_sender,
+            )
+            .await;
+        }));
+    }
+
+    fn cancel_in_flight_request(&self) {
+        if let Some(cancel_sender) = &self.request_cancel_sender {
+            let _ = cancel_sender.send(true);
+        }
+    }
+
+    fn clear_runtime_request_handles(&mut self) {
+        self.request_task = None;
+        self.request_cancel_sender = None;
+    }
+
     fn apply_action(&mut self, action: Action) {
         match action {
             Action::Tick | Action::Render => {}
@@ -542,6 +1278,7 @@ impl App {
                 }
             }
             Action::SetHeader { index, row } => {
+                track_content_type_manual_override_on_set(&mut self.state.request, index, &row);
                 upsert_row_with_limit(
                     &mut self.state.request.headers,
                     index,
@@ -552,6 +1289,9 @@ impl App {
                     &mut self.state.request.headers_editor,
                     &self.state.request.headers,
                 );
+                dedupe_named_header(&mut self.state.request, "Authorization", Some(index));
+                dedupe_named_header(&mut self.state.request, "Content-Type", Some(index));
+                reconcile_authorization_header(&mut self.state.request);
             }
             Action::AddHeader => {
                 if self.state.request.headers.len() >= MAX_HEADER_ROWS {
@@ -562,14 +1302,18 @@ impl App {
                     &mut self.state.request.headers_editor,
                     &self.state.request.headers,
                 );
+                reconcile_authorization_header(&mut self.state.request);
             }
             Action::RemoveHeader(index) => {
                 if index < self.state.request.headers.len() {
+                    track_content_type_manual_override_on_remove(&mut self.state.request, index);
                     self.state.request.headers.remove(index);
+                    adjust_managed_header_indices_on_remove(&mut self.state.request, index);
                     normalize_editor_state(
                         &mut self.state.request.headers_editor,
                         &self.state.request.headers,
                     );
+                    reconcile_authorization_header(&mut self.state.request);
                 }
             }
             Action::SetQueryParam { index, row } => {
@@ -611,8 +1355,392 @@ impl App {
                     );
                 }
             }
+            Action::SetAuthMode(mode) => {
+                self.state.request.auth_mode = mode;
+                clear_auth_credentials_for_mode(&mut self.state.request);
+                self.state.request.auth_editor.active_field = match mode {
+                    AuthMode::None => AuthField::Mode,
+                    AuthMode::Bearer => {
+                        if matches!(
+                            self.state.request.auth_editor.active_field,
+                            AuthField::Username | AuthField::Password
+                        ) {
+                            AuthField::Token
+                        } else {
+                            self.state.request.auth_editor.active_field
+                        }
+                    }
+                    AuthMode::Basic => {
+                        if self.state.request.auth_editor.active_field == AuthField::Token {
+                            AuthField::Username
+                        } else {
+                            self.state.request.auth_editor.active_field
+                        }
+                    }
+                };
+                normalize_auth_editor(&mut self.state.request);
+                reconcile_authorization_header(&mut self.state.request);
+            }
+            Action::SetAuthToken(token) => {
+                if token.chars().count() > MAX_AUTH_TOKEN_LENGTH {
+                    return;
+                }
+                self.state.request.auth_token = token;
+                normalize_auth_editor(&mut self.state.request);
+                reconcile_authorization_header(&mut self.state.request);
+            }
+            Action::SetAuthCredentials { username, password } => {
+                if username.chars().count() > MAX_AUTH_USERNAME_LENGTH
+                    || password.chars().count() > MAX_AUTH_PASSWORD_LENGTH
+                {
+                    return;
+                }
+                self.state.request.auth_username = username;
+                self.state.request.auth_password = password;
+                normalize_auth_editor(&mut self.state.request);
+                reconcile_authorization_header(&mut self.state.request);
+            }
+            Action::SetBodyFormat(format) => {
+                self.state.request.body_format = format;
+                self.state.request.content_type_manual_override = false;
+                if self.state.request.body_editor.active_field == BodyField::Json
+                    && format == BodyFormat::Form
+                {
+                    self.state.request.body_editor.active_field = BodyField::Form;
+                }
+                if self.state.request.body_editor.active_field == BodyField::Form
+                    && format == BodyFormat::Json
+                {
+                    self.state.request.body_editor.active_field = BodyField::Json;
+                }
+                apply_body_content_type_header(&mut self.state.request, true);
+                normalize_body_editor(&mut self.state.request);
+            }
+            Action::SetBodyContent(content) => match content {
+                BodyContent::Json(json) => {
+                    if json.chars().count() > MAX_BODY_TEXT_LENGTH {
+                        return;
+                    }
+                    self.state.request.body_json = json;
+                    normalize_body_editor(&mut self.state.request);
+                }
+                BodyContent::SetFormRow { index, row } => {
+                    upsert_row_with_limit(
+                        &mut self.state.request.body_form,
+                        index,
+                        limit_key_value_row(row),
+                        MAX_BODY_FORM_ROWS,
+                    );
+                    normalize_editor_state(
+                        &mut self.state.request.body_editor.form_editor,
+                        &self.state.request.body_form,
+                    );
+                }
+                BodyContent::AddFormRow => {
+                    if self.state.request.body_form.len() >= MAX_BODY_FORM_ROWS {
+                        return;
+                    }
+                    self.state.request.body_form.push(KeyValueRow::default());
+                    normalize_editor_state(
+                        &mut self.state.request.body_editor.form_editor,
+                        &self.state.request.body_form,
+                    );
+                }
+                BodyContent::RemoveFormRow(index) => {
+                    if index < self.state.request.body_form.len() {
+                        self.state.request.body_form.remove(index);
+                        normalize_editor_state(
+                            &mut self.state.request.body_editor.form_editor,
+                            &self.state.request.body_form,
+                        );
+                    }
+                }
+            },
+            Action::SendRequest => {
+                self.state.response.last_error = None;
+                self.state.response.cancelled = false;
+                self.start_request_execution();
+            }
+            Action::CancelRequest => {
+                if let Some(in_flight) = self.state.response.in_flight.as_mut() {
+                    in_flight.cancellation_requested = true;
+                }
+                self.cancel_in_flight_request();
+            }
+            Action::RequestStarted {
+                request_id,
+                method,
+                url,
+            } => {
+                self.state.response.last_request_id = Some(request_id);
+                self.state.response.in_flight = Some(InFlightRequest {
+                    id: request_id,
+                    method,
+                    url,
+                    cancellation_requested: false,
+                });
+                self.state.response.buffer.clear();
+                self.state.response.scroll_offset = 0;
+                self.state.response.horizontal_scroll_offset = 0;
+                self.state.response.metadata = None;
+                self.state.response.last_error = None;
+                self.state.response.cancelled = false;
+                self.state.response.truncated = false;
+                self.recompute_response_search();
+            }
+            Action::RequestCompleted {
+                request_id,
+                mut metadata,
+            } => {
+                if self.state.response.last_request_id == Some(request_id) {
+                    metadata.truncated = self.state.response.truncated;
+                    self.state.response.metadata = Some(metadata);
+                    self.state.response.in_flight = None;
+                    self.state.response.cancelled = false;
+                    let max_scroll = response_scroll_upper_bound(&self.state.response);
+                    self.state.response.scroll_offset =
+                        self.state.response.scroll_offset.min(max_scroll);
+                    self.recompute_response_search();
+                    self.clear_runtime_request_handles();
+                }
+            }
+            Action::RequestFailed { request_id, error } => {
+                if self.state.response.last_request_id == Some(request_id) {
+                    self.state.response.last_error = Some(sanitize_terminal_text(&error));
+                    self.state.response.in_flight = None;
+                    self.recompute_response_search();
+                    self.clear_runtime_request_handles();
+                }
+            }
+            Action::RequestCancelled { request_id } => {
+                if self.state.response.last_request_id == Some(request_id) {
+                    self.state.response.in_flight = None;
+                    self.state.response.cancelled = true;
+                    self.recompute_response_search();
+                    self.clear_runtime_request_handles();
+                }
+            }
+            Action::ResponseChunk { request_id, chunk } => {
+                if self.state.response.last_request_id == Some(request_id) {
+                    let chunk_len = chunk.len();
+                    self.state.response.buffer.append_chunk(&chunk);
+                    self.state.response.truncated = self.state.response.buffer.is_truncated();
+                    let max_scroll = response_scroll_upper_bound(&self.state.response);
+                    self.state.response.scroll_offset =
+                        self.state.response.scroll_offset.min(max_scroll);
+                    if self.state.response.search.active {
+                        self.pending_response_search_bytes =
+                            self.pending_response_search_bytes.saturating_add(chunk_len);
+                        if self.pending_response_search_bytes
+                            >= RESPONSE_SEARCH_RECOMPUTE_CHUNK_BYTES
+                        {
+                            self.recompute_response_search();
+                        }
+                    }
+                }
+            }
+            Action::ScrollResponse(delta) => {
+                let max_scroll = response_scroll_upper_bound(&self.state.response);
+                if delta >= 0 {
+                    self.state.response.scroll_offset = self
+                        .state
+                        .response
+                        .scroll_offset
+                        .saturating_add(delta as usize)
+                        .min(max_scroll);
+                } else {
+                    self.state.response.scroll_offset = self
+                        .state
+                        .response
+                        .scroll_offset
+                        .saturating_sub(delta.unsigned_abs() as usize);
+                }
+            }
+            Action::ScrollResponseHorizontal(delta) => {
+                if delta >= 0 {
+                    self.state.response.horizontal_scroll_offset = self
+                        .state
+                        .response
+                        .horizontal_scroll_offset
+                        .saturating_add(delta as usize);
+                } else {
+                    self.state.response.horizontal_scroll_offset = self
+                        .state
+                        .response
+                        .horizontal_scroll_offset
+                        .saturating_sub(delta.unsigned_abs() as usize);
+                }
+            }
+            Action::ToggleResponseWrap => {
+                self.state.response.wrap_lines = !self.state.response.wrap_lines;
+                if self.state.response.wrap_lines {
+                    self.state.response.horizontal_scroll_offset = 0;
+                }
+            }
+            Action::SetResponseTab(tab) => {
+                self.state.response.active_tab = tab;
+                if self.state.response.search.active {
+                    self.state.response.search.scope = search_scope_for_tab(tab);
+                    self.recompute_response_search();
+                }
+            }
+            Action::OpenResponseSearch => {
+                self.state.response.search.active = true;
+                self.state.response.search.scope =
+                    search_scope_for_tab(self.state.response.active_tab);
+                self.recompute_response_search();
+            }
+            Action::CloseResponseSearch => {
+                self.state.response.search.active = false;
+                self.state.response.search.query.clear();
+                self.state.response.search.matches.clear();
+                self.state.response.search.current_match = None;
+            }
+            Action::SearchInResponse(query) => {
+                let mut bounded_query = query;
+                truncate_to_char_limit(&mut bounded_query, MAX_RESPONSE_SEARCH_QUERY_CHARS);
+                self.state.response.search.query = bounded_query;
+                self.recompute_response_search();
+            }
+            Action::NextSearchMatch => {
+                let match_count = self.state.response.search.matches.len();
+                if match_count == 0 {
+                    return;
+                }
+                let current = self
+                    .state
+                    .response
+                    .search
+                    .current_match
+                    .filter(|index| *index < match_count);
+                let next = match current {
+                    Some(index) => (index + 1) % match_count,
+                    None => 0,
+                };
+                self.state.response.search.current_match = Some(next);
+                self.scroll_to_search_match(next);
+            }
+            Action::PrevSearchMatch => {
+                let match_count = self.state.response.search.matches.len();
+                if match_count == 0 {
+                    return;
+                }
+                let current = self
+                    .state
+                    .response
+                    .search
+                    .current_match
+                    .filter(|index| *index < match_count);
+                let prev = match current {
+                    Some(0) | None => match_count - 1,
+                    Some(index) => index - 1,
+                };
+                self.state.response.search.current_match = Some(prev);
+                self.scroll_to_search_match(prev);
+            }
+            Action::ToggleHelp => {
+                self.state.help_visible = !self.state.help_visible;
+            }
+            Action::CloseHelp => {
+                self.state.help_visible = false;
+            }
         }
     }
+
+    fn recompute_response_search(&mut self) {
+        self.pending_response_search_bytes = 0;
+
+        if !self.state.response.search.active {
+            self.state.response.search.matches.clear();
+            self.state.response.search.current_match = None;
+            return;
+        }
+
+        let mut query = self.state.response.search.query.clone();
+        truncate_to_char_limit(&mut query, MAX_RESPONSE_SEARCH_QUERY_CHARS);
+        if query != self.state.response.search.query {
+            self.state.response.search.query = query.clone();
+        }
+        if query.is_empty() {
+            self.state.response.search.matches.clear();
+            self.state.response.search.current_match = None;
+            return;
+        }
+
+        let lines = response_search_lines(&self.state, self.state.response.search.scope);
+        let matches = find_line_matches(&lines, &query, MAX_RESPONSE_SEARCH_MATCHES);
+        self.state.response.search.matches = matches;
+        self.state.response.search.current_match = if self.state.response.search.matches.is_empty()
+        {
+            None
+        } else {
+            Some(0)
+        };
+        if self.state.response.search.current_match.is_some() {
+            self.scroll_to_search_match(0);
+        }
+    }
+
+    fn scroll_to_search_match(&mut self, match_index: usize) {
+        let Some(entry) = self.state.response.search.matches.get(match_index) else {
+            return;
+        };
+        self.state.response.scroll_offset = entry.line_index;
+    }
+}
+
+fn response_scroll_upper_bound(response: &crate::state::ResponseState) -> usize {
+    response
+        .buffer
+        .total_bytes()
+        .saturating_add(response.buffer.total_lines())
+}
+
+fn search_scope_for_tab(tab: ResponseTab) -> ResponseSearchScope {
+    match tab {
+        ResponseTab::Body => ResponseSearchScope::Body,
+        ResponseTab::Headers => ResponseSearchScope::Headers,
+        ResponseTab::Raw => ResponseSearchScope::Raw,
+    }
+}
+
+fn response_search_lines(state: &AppState, scope: ResponseSearchScope) -> Vec<String> {
+    match scope {
+        ResponseSearchScope::Body => body_search_lines(state),
+        ResponseSearchScope::Headers => header_lines(state),
+        ResponseSearchScope::Raw => raw_lines(state),
+    }
+}
+
+fn find_line_matches(lines: &[String], query: &str, max_matches: usize) -> Vec<SearchMatch> {
+    if query.is_empty() || max_matches == 0 {
+        return Vec::new();
+    }
+
+    let needle_len = query.chars().count();
+    let mut matches = Vec::new();
+
+    'line_scan: for (line_index, line) in lines.iter().enumerate() {
+        let mut search_from_byte = 0;
+        while search_from_byte <= line.len() {
+            let Some(relative_byte_index) = line[search_from_byte..].find(query) else {
+                break;
+            };
+            let start_byte = search_from_byte + relative_byte_index;
+            let start_char = line[..start_byte].chars().count();
+            matches.push(SearchMatch {
+                line_index,
+                start_char,
+                end_char: start_char + needle_len,
+            });
+            if matches.len() >= max_matches {
+                break 'line_scan;
+            }
+            search_from_byte = start_byte.saturating_add(query.len());
+        }
+    }
+
+    matches
 }
 
 struct SyncGuard<'a> {
@@ -630,6 +1758,340 @@ impl Drop for SyncGuard<'_> {
     fn drop(&mut self) {
         self.request.sync_guard = None;
     }
+}
+
+fn next_auth_field(field: AuthField, mode: AuthMode) -> AuthField {
+    match mode {
+        AuthMode::None => AuthField::Mode,
+        AuthMode::Bearer => match field {
+            AuthField::Mode => AuthField::Token,
+            AuthField::Token => AuthField::Mode,
+            AuthField::Username | AuthField::Password => AuthField::Mode,
+        },
+        AuthMode::Basic => match field {
+            AuthField::Mode => AuthField::Username,
+            AuthField::Username => AuthField::Password,
+            AuthField::Password => AuthField::Mode,
+            AuthField::Token => AuthField::Mode,
+        },
+    }
+}
+
+fn prev_auth_field(field: AuthField, mode: AuthMode) -> AuthField {
+    match mode {
+        AuthMode::None => AuthField::Mode,
+        AuthMode::Bearer => match field {
+            AuthField::Mode => AuthField::Token,
+            AuthField::Token => AuthField::Mode,
+            AuthField::Username | AuthField::Password => AuthField::Mode,
+        },
+        AuthMode::Basic => match field {
+            AuthField::Mode => AuthField::Password,
+            AuthField::Username => AuthField::Mode,
+            AuthField::Password => AuthField::Username,
+            AuthField::Token => AuthField::Mode,
+        },
+    }
+}
+
+fn next_body_field(field: BodyField, format: BodyFormat) -> BodyField {
+    match format {
+        BodyFormat::Json => match field {
+            BodyField::Format => BodyField::Json,
+            BodyField::Json => BodyField::Format,
+            BodyField::Form => BodyField::Format,
+        },
+        BodyFormat::Form => match field {
+            BodyField::Format => BodyField::Form,
+            BodyField::Form => BodyField::Format,
+            BodyField::Json => BodyField::Format,
+        },
+    }
+}
+
+fn prev_body_field(field: BodyField, format: BodyFormat) -> BodyField {
+    next_body_field(field, format)
+}
+
+fn normalize_auth_editor(request: &mut crate::state::RequestState) {
+    let editor = &mut request.auth_editor;
+    let token_len = request.auth_token.chars().count();
+    let username_len = request.auth_username.chars().count();
+    let password_len = request.auth_password.chars().count();
+    editor.token_cursor = editor.token_cursor.min(token_len);
+    editor.username_cursor = editor.username_cursor.min(username_len);
+    editor.password_cursor = editor.password_cursor.min(password_len);
+
+    editor.active_field = match request.auth_mode {
+        AuthMode::None => AuthField::Mode,
+        AuthMode::Bearer => match editor.active_field {
+            AuthField::Username | AuthField::Password => AuthField::Token,
+            _ => editor.active_field,
+        },
+        AuthMode::Basic => match editor.active_field {
+            AuthField::Token => AuthField::Username,
+            _ => editor.active_field,
+        },
+    };
+}
+
+fn normalize_body_editor(request: &mut crate::state::RequestState) {
+    let max_cursor = request.body_json.chars().count();
+    request.body_editor.json_cursor = request.body_editor.json_cursor.min(max_cursor);
+    normalize_editor_state(&mut request.body_editor.form_editor, &request.body_form);
+    let line_count = request.body_json.split('\n').count().max(1);
+    request.body_editor.json_scroll = request.body_editor.json_scroll.min(line_count - 1);
+
+    request.body_editor.active_field = match request.body_format {
+        BodyFormat::Json => {
+            if request.body_editor.active_field == BodyField::Form {
+                BodyField::Json
+            } else {
+                request.body_editor.active_field
+            }
+        }
+        BodyFormat::Form => {
+            if request.body_editor.active_field == BodyField::Json {
+                BodyField::Form
+            } else {
+                request.body_editor.active_field
+            }
+        }
+    };
+}
+
+fn computed_authorization_value(request: &crate::state::RequestState) -> Option<String> {
+    match request.auth_mode {
+        AuthMode::None => None,
+        AuthMode::Bearer => {
+            if request.auth_token.trim().is_empty() {
+                None
+            } else {
+                Some(format!("Bearer {}", request.auth_token))
+            }
+        }
+        AuthMode::Basic => {
+            if request.auth_username.trim().is_empty() {
+                return None;
+            }
+            let raw = format!("{}:{}", request.auth_username, request.auth_password);
+            let encoded = base64::engine::general_purpose::STANDARD.encode(raw);
+            Some(format!("Basic {encoded}"))
+        }
+    }
+}
+
+fn reconcile_authorization_header(request: &mut crate::state::RequestState) {
+    let desired = computed_authorization_value(request);
+    if let Some(value) = desired {
+        let index = upsert_named_header(
+            &mut request.headers,
+            "Authorization",
+            value,
+            request.managed_auth_header_index,
+            MAX_HEADER_ROWS,
+        );
+        request.managed_auth_header_index = dedupe_named_header(request, "Authorization", index);
+    } else if let Some(index) = request.managed_auth_header_index.take()
+        && index < request.headers.len()
+        && header_name_matches(&request.headers[index].key, "Authorization")
+    {
+        request.headers.remove(index);
+        adjust_managed_header_indices_on_remove(request, index);
+    }
+}
+
+fn apply_body_content_type_header(request: &mut crate::state::RequestState, force: bool) {
+    if !force && request.content_type_manual_override {
+        return;
+    }
+
+    let value = request.body_format.content_type().to_string();
+    let index = upsert_named_header(
+        &mut request.headers,
+        "Content-Type",
+        value,
+        request.managed_content_type_header_index,
+        MAX_HEADER_ROWS,
+    );
+    request.managed_content_type_header_index = dedupe_named_header(request, "Content-Type", index);
+}
+
+fn upsert_named_header(
+    headers: &mut Vec<KeyValueRow>,
+    name: &str,
+    value: String,
+    preferred_index: Option<usize>,
+    max_headers: usize,
+) -> Option<usize> {
+    let target = canonical_header_name(name);
+
+    if let Some(index) = preferred_index
+        && index < headers.len()
+        && canonical_header_name(&headers[index].key) == target
+    {
+        headers[index] = KeyValueRow {
+            enabled: true,
+            key: name.to_string(),
+            value,
+        };
+        return Some(index);
+    }
+
+    if let Some(index) = headers
+        .iter()
+        .position(|row| canonical_header_name(&row.key) == target)
+    {
+        headers[index] = KeyValueRow {
+            enabled: true,
+            key: name.to_string(),
+            value,
+        };
+        return Some(index);
+    }
+
+    if headers.len() >= max_headers {
+        return None;
+    }
+
+    headers.push(KeyValueRow {
+        enabled: true,
+        key: name.to_string(),
+        value,
+    });
+    Some(headers.len() - 1)
+}
+
+fn track_content_type_manual_override_on_set(
+    request: &mut crate::state::RequestState,
+    index: usize,
+    row: &KeyValueRow,
+) {
+    let touches_managed_index = request.managed_content_type_header_index == Some(index);
+    let touches_content_type_name = header_name_matches(&row.key, "Content-Type")
+        || request
+            .headers
+            .get(index)
+            .map(|existing| header_name_matches(&existing.key, "Content-Type"))
+            .unwrap_or(false);
+
+    if touches_managed_index || touches_content_type_name {
+        request.content_type_manual_override = true;
+    }
+}
+
+fn track_content_type_manual_override_on_remove(
+    request: &mut crate::state::RequestState,
+    index: usize,
+) {
+    let touches_managed_index = request.managed_content_type_header_index == Some(index);
+    let touches_content_type_name = request
+        .headers
+        .get(index)
+        .map(|row| header_name_matches(&row.key, "Content-Type"))
+        .unwrap_or(false);
+
+    if touches_managed_index || touches_content_type_name {
+        request.content_type_manual_override = true;
+        request.managed_content_type_header_index = None;
+    }
+}
+
+fn adjust_managed_header_indices_on_remove(
+    request: &mut crate::state::RequestState,
+    removed: usize,
+) {
+    request.managed_auth_header_index =
+        shift_index_after_remove(request.managed_auth_header_index, removed);
+    request.managed_content_type_header_index =
+        shift_index_after_remove(request.managed_content_type_header_index, removed);
+}
+
+fn dedupe_named_header(
+    request: &mut crate::state::RequestState,
+    name: &str,
+    preferred_index: Option<usize>,
+) -> Option<usize> {
+    let target = canonical_header_name(name);
+    let mut matching_indices: Vec<usize> = request
+        .headers
+        .iter()
+        .enumerate()
+        .filter_map(|(index, row)| (canonical_header_name(&row.key) == target).then_some(index))
+        .collect();
+
+    if matching_indices.is_empty() {
+        return None;
+    }
+
+    let mut keep_index = preferred_index
+        .filter(|index| matching_indices.binary_search(index).is_ok())
+        .unwrap_or(matching_indices[0]);
+
+    while let Some(index) = matching_indices.pop() {
+        if index == keep_index {
+            continue;
+        }
+
+        request.headers.remove(index);
+        adjust_managed_header_indices_on_remove(request, index);
+        if index < keep_index {
+            keep_index -= 1;
+        }
+    }
+
+    Some(keep_index)
+}
+
+fn clear_auth_credentials_for_mode(request: &mut crate::state::RequestState) {
+    match request.auth_mode {
+        AuthMode::None => {
+            request.auth_token.clear();
+            request.auth_username.clear();
+            request.auth_password.clear();
+        }
+        AuthMode::Bearer => {
+            request.auth_username.clear();
+            request.auth_password.clear();
+        }
+        AuthMode::Basic => {
+            request.auth_token.clear();
+        }
+    }
+}
+
+fn canonical_header_name(name: &str) -> String {
+    name.trim().to_ascii_lowercase()
+}
+
+fn header_name_matches(actual: &str, expected: &str) -> bool {
+    canonical_header_name(actual) == canonical_header_name(expected)
+}
+
+fn shift_index_after_remove(index: Option<usize>, removed: usize) -> Option<usize> {
+    match index {
+        Some(current) if current == removed => None,
+        Some(current) if current > removed => Some(current - 1),
+        other => other,
+    }
+}
+
+fn line_start_index(value: &str, cursor: usize) -> usize {
+    let chars: Vec<char> = value.chars().collect();
+    let mut index = cursor.min(chars.len());
+    while index > 0 && chars[index - 1] != '\n' {
+        index -= 1;
+    }
+    index
+}
+
+fn line_end_index(value: &str, cursor: usize) -> usize {
+    let chars: Vec<char> = value.chars().collect();
+    let mut index = cursor.min(chars.len());
+    while index < chars.len() && chars[index] != '\n' {
+        index += 1;
+    }
+    index
 }
 
 fn normalize_editor_state(editor: &mut KeyValueEditorState, rows: &[KeyValueRow]) {
@@ -749,10 +2211,17 @@ fn remove_char(value: &mut String, cursor: usize) {
 #[cfg(test)]
 mod tests {
     use super::{
-        derive_query_token, limit_key_value_row, truncate_to_char_limit, upsert_query_row_with_token,
-        upsert_row_with_limit,
+        App, MAX_RESPONSE_SEARCH_MATCHES, MAX_RESPONSE_SEARCH_QUERY_CHARS,
+        RESPONSE_SEARCH_RECOMPUTE_CHUNK_BYTES, canonical_header_name, derive_query_token,
+        find_line_matches, limit_key_value_row, truncate_to_char_limit,
+        upsert_query_row_with_token, upsert_row_with_limit,
     };
-    use crate::state::{KeyValueRow, QueryParamToken, MAX_KEY_LENGTH, MAX_VALUE_LENGTH};
+    use crate::action::{Action, BodyContent};
+    use crate::state::{
+        AuthMode, BodyFormat, KeyValueRow, MAX_KEY_LENGTH, MAX_VALUE_LENGTH, QueryParamToken,
+        RequestFocus, ResponseMetadata, ResponseSearchScope, ResponseTab,
+    };
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     #[test]
     fn upsert_respects_row_limit() {
@@ -817,5 +2286,519 @@ mod tests {
         );
 
         assert_eq!(token, QueryParamToken::KeyOnly);
+    }
+
+    #[test]
+    fn find_line_matches_respects_global_cap() {
+        let lines = vec!["a".repeat(MAX_RESPONSE_SEARCH_MATCHES + 32)];
+
+        let matches = find_line_matches(&lines, "a", MAX_RESPONSE_SEARCH_MATCHES);
+        assert_eq!(matches.len(), MAX_RESPONSE_SEARCH_MATCHES);
+        assert_eq!(matches.first().map(|m| m.start_char), Some(0));
+        assert_eq!(
+            matches.last().map(|m| m.start_char),
+            Some(MAX_RESPONSE_SEARCH_MATCHES - 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn ctrl_slash_does_not_open_response_search() {
+        let mut app = App::new((120, 40));
+
+        let actions =
+            app.map_key_event_to_actions(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL));
+
+        assert_ne!(actions, vec![Action::OpenResponseSearch, Action::Render]);
+    }
+
+    #[tokio::test]
+    async fn ctrl_unit_separator_does_not_open_response_search() {
+        let mut app = App::new((120, 40));
+
+        let actions = app.map_key_event_to_actions(KeyEvent::new(
+            KeyCode::Char('\u{1f}'),
+            KeyModifiers::CONTROL,
+        ));
+
+        assert_ne!(actions, vec![Action::OpenResponseSearch, Action::Render]);
+    }
+
+    #[tokio::test]
+    async fn ctrl_f_opens_response_search_fallback() {
+        let mut app = App::new((120, 40));
+
+        let actions =
+            app.map_key_event_to_actions(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+
+        assert_eq!(actions, vec![Action::OpenResponseSearch, Action::Render]);
+    }
+
+    #[tokio::test]
+    async fn ctrl_shift_slash_does_not_toggle_help_modal() {
+        let mut app = App::new((120, 40));
+
+        let open_actions_shifted_slash = app.map_key_event_to_actions(KeyEvent::new(
+            KeyCode::Char('/'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        assert_ne!(
+            open_actions_shifted_slash,
+            vec![Action::ToggleHelp, Action::Render]
+        );
+    }
+
+    #[tokio::test]
+    async fn ctrl_question_mark_does_not_toggle_help_modal() {
+        let mut app = App::new((120, 40));
+
+        let actions = app.map_key_event_to_actions(KeyEvent::new(
+            KeyCode::Char('?'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+
+        assert_ne!(actions, vec![Action::ToggleHelp, Action::Render]);
+    }
+
+    #[tokio::test]
+    async fn f1_toggles_help_modal_fallback() {
+        let mut app = App::new((120, 40));
+
+        let actions =
+            app.map_key_event_to_actions(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE));
+
+        assert_eq!(actions, vec![Action::ToggleHelp, Action::Render]);
+    }
+
+    #[tokio::test]
+    async fn esc_closes_help_modal_and_blocks_other_shortcuts() {
+        let mut app = App::new((120, 40));
+        app.state.help_visible = true;
+
+        let ignored =
+            app.map_key_event_to_actions(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(ignored.is_empty());
+
+        let close_actions =
+            app.map_key_event_to_actions(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(close_actions, vec![Action::CloseHelp, Action::Render]);
+    }
+
+    #[tokio::test]
+    async fn slash_in_url_input_inserts_slash() {
+        let mut app = App::new((120, 40));
+        app.state.request.focus = RequestFocus::Url;
+        app.state.request.url.clear();
+        app.state.request.url_cursor = 0;
+
+        let actions =
+            app.map_key_event_to_actions(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+
+        assert_eq!(
+            actions,
+            vec![
+                Action::SetUrl(String::from("/")),
+                Action::SyncParamsFromUrl,
+                Action::Render,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_slash_does_not_open_response_search() {
+        let mut app = App::new((120, 40));
+
+        let actions =
+            app.map_key_event_to_actions(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+
+        assert_ne!(actions, vec![Action::OpenResponseSearch, Action::Render]);
+    }
+
+    #[tokio::test]
+    async fn alt_four_no_longer_selects_response_tab() {
+        let mut app = App::new((120, 40));
+
+        let actions =
+            app.map_key_event_to_actions(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::ALT));
+
+        assert!(actions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn active_search_keeps_esc_and_n_navigation() {
+        let mut app = App::new((120, 40));
+        app.state.response.search.active = true;
+
+        let next_actions =
+            app.map_key_event_to_actions(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert_eq!(next_actions, vec![Action::NextSearchMatch, Action::Render]);
+
+        let prev_actions =
+            app.map_key_event_to_actions(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT));
+        assert_eq!(prev_actions, vec![Action::PrevSearchMatch, Action::Render]);
+
+        let close_actions =
+            app.map_key_event_to_actions(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(
+            close_actions,
+            vec![Action::CloseResponseSearch, Action::Render]
+        );
+    }
+
+    #[tokio::test]
+    async fn response_search_works_in_headers_tab() {
+        let mut app = App::new((120, 40));
+        app.state.response.metadata = Some(ResponseMetadata {
+            headers: vec![
+                (String::from("server"), String::from("nginx")),
+                (String::from("x-id"), String::from("abc-123")),
+            ],
+            ..ResponseMetadata::default()
+        });
+        app.apply_action(Action::SetResponseTab(ResponseTab::Headers));
+
+        app.apply_action(Action::OpenResponseSearch);
+        app.apply_action(Action::SearchInResponse(String::from("abc")));
+
+        assert_eq!(
+            app.state.response.search.scope,
+            ResponseSearchScope::Headers
+        );
+        assert_eq!(app.state.response.search.matches.len(), 1);
+        assert_eq!(app.state.response.search.current_match, Some(0));
+    }
+
+    #[tokio::test]
+    async fn switching_response_tabs_recomputes_search_scope_and_matches() {
+        let mut app = App::new((120, 40));
+        app.state.response.buffer.append_chunk(b"body-match");
+        app.state.response.metadata = Some(ResponseMetadata {
+            headers: vec![(String::from("x-trace"), String::from("header-match"))],
+            ..ResponseMetadata::default()
+        });
+
+        app.apply_action(Action::OpenResponseSearch);
+        app.apply_action(Action::SearchInResponse(String::from("match")));
+
+        assert_eq!(app.state.response.search.scope, ResponseSearchScope::Body);
+        assert_eq!(app.state.response.search.matches.len(), 1);
+
+        app.apply_action(Action::SetResponseTab(ResponseTab::Headers));
+        assert_eq!(
+            app.state.response.search.scope,
+            ResponseSearchScope::Headers
+        );
+        assert_eq!(app.state.response.search.matches.len(), 1);
+
+        app.apply_action(Action::SetResponseTab(ResponseTab::Raw));
+        assert_eq!(app.state.response.search.scope, ResponseSearchScope::Raw);
+        assert_eq!(app.state.response.search.matches.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn search_query_is_clamped_to_max_length() {
+        let mut app = App::new((120, 40));
+        app.apply_action(Action::OpenResponseSearch);
+        app.apply_action(Action::SearchInResponse(
+            "x".repeat(MAX_RESPONSE_SEARCH_QUERY_CHARS + 32),
+        ));
+
+        assert_eq!(
+            app.state.response.search.query.chars().count(),
+            MAX_RESPONSE_SEARCH_QUERY_CHARS
+        );
+    }
+
+    #[tokio::test]
+    async fn closing_response_search_clears_query_and_matches() {
+        let mut app = App::new((120, 40));
+        app.state.response.buffer.append_chunk(b"hello hello");
+
+        app.apply_action(Action::OpenResponseSearch);
+        app.apply_action(Action::SearchInResponse(String::from("hello")));
+        assert!(!app.state.response.search.matches.is_empty());
+
+        app.apply_action(Action::CloseResponseSearch);
+        assert!(!app.state.response.search.active);
+        assert!(app.state.response.search.query.is_empty());
+        assert!(app.state.response.search.matches.is_empty());
+        assert_eq!(app.state.response.search.current_match, None);
+    }
+
+    #[tokio::test]
+    async fn response_chunks_do_not_recompute_search_when_inactive() {
+        let mut app = App::new((120, 40));
+        app.state.response.last_request_id = Some(7);
+        app.state.response.search.query = String::from("a");
+
+        app.apply_action(Action::ResponseChunk {
+            request_id: 7,
+            chunk: b"a a a".to_vec(),
+        });
+
+        assert!(app.state.response.search.matches.is_empty());
+        assert_eq!(app.state.response.search.current_match, None);
+    }
+
+    #[tokio::test]
+    async fn response_chunks_throttle_search_recompute_until_threshold() {
+        let mut app = App::new((120, 40));
+        app.state.response.last_request_id = Some(7);
+        app.apply_action(Action::OpenResponseSearch);
+        app.apply_action(Action::SearchInResponse(String::from("a")));
+
+        let almost_threshold = vec![b'a'; RESPONSE_SEARCH_RECOMPUTE_CHUNK_BYTES - 1];
+        app.apply_action(Action::ResponseChunk {
+            request_id: 7,
+            chunk: almost_threshold,
+        });
+
+        assert!(app.state.response.search.matches.is_empty());
+        assert_eq!(
+            app.pending_response_search_bytes,
+            RESPONSE_SEARCH_RECOMPUTE_CHUNK_BYTES - 1
+        );
+
+        app.apply_action(Action::ResponseChunk {
+            request_id: 7,
+            chunk: vec![b'a'],
+        });
+
+        assert!(!app.state.response.search.matches.is_empty());
+        assert_eq!(app.pending_response_search_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn request_completion_forces_final_search_recompute() {
+        let mut app = App::new((120, 40));
+        app.state.response.last_request_id = Some(7);
+        app.apply_action(Action::OpenResponseSearch);
+        app.apply_action(Action::SearchInResponse(String::from("z")));
+
+        app.apply_action(Action::ResponseChunk {
+            request_id: 7,
+            chunk: vec![b'z'; RESPONSE_SEARCH_RECOMPUTE_CHUNK_BYTES - 1],
+        });
+
+        assert!(app.state.response.search.matches.is_empty());
+
+        app.apply_action(Action::RequestCompleted {
+            request_id: 7,
+            metadata: ResponseMetadata::default(),
+        });
+
+        assert!(!app.state.response.search.matches.is_empty());
+        assert_eq!(app.pending_response_search_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn search_navigation_handles_out_of_range_current_match() {
+        let mut app = App::new((120, 40));
+        app.state
+            .response
+            .buffer
+            .append_chunk("a".repeat(MAX_RESPONSE_SEARCH_MATCHES + 4).as_bytes());
+
+        app.apply_action(Action::OpenResponseSearch);
+        app.apply_action(Action::SearchInResponse(String::from("a")));
+        assert_eq!(
+            app.state.response.search.matches.len(),
+            MAX_RESPONSE_SEARCH_MATCHES
+        );
+
+        app.state.response.search.current_match = Some(MAX_RESPONSE_SEARCH_MATCHES + 10);
+        app.apply_action(Action::NextSearchMatch);
+        assert_eq!(app.state.response.search.current_match, Some(0));
+
+        app.state.response.search.current_match = Some(MAX_RESPONSE_SEARCH_MATCHES + 10);
+        app.apply_action(Action::PrevSearchMatch);
+        assert_eq!(
+            app.state.response.search.current_match,
+            Some(MAX_RESPONSE_SEARCH_MATCHES - 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn basic_auth_base64_is_correct() {
+        let mut app = App::new((120, 40));
+        app.apply_action(Action::SetAuthMode(AuthMode::Basic));
+        app.apply_action(Action::SetAuthCredentials {
+            username: String::from("alice"),
+            password: String::from("secret"),
+        });
+
+        let value = header_value(&app, "Authorization");
+        assert_eq!(value, Some("Basic YWxpY2U6c2VjcmV0"));
+    }
+
+    #[tokio::test]
+    async fn authorization_header_transitions_between_modes() {
+        let mut app = App::new((120, 40));
+
+        app.apply_action(Action::SetAuthMode(AuthMode::Bearer));
+        app.apply_action(Action::SetAuthToken(String::from("tkn")));
+        assert_eq!(header_value(&app, "Authorization"), Some("Bearer tkn"));
+
+        app.apply_action(Action::SetAuthMode(AuthMode::Basic));
+        app.apply_action(Action::SetAuthCredentials {
+            username: String::from("u"),
+            password: String::from("p"),
+        });
+        assert_eq!(header_value(&app, "Authorization"), Some("Basic dTpw"));
+
+        app.apply_action(Action::SetAuthMode(AuthMode::None));
+        assert_eq!(header_value(&app, "Authorization"), None);
+
+        app.apply_action(Action::AddHeader);
+        app.apply_action(Action::SetHeader {
+            index: 0,
+            row: KeyValueRow {
+                enabled: true,
+                key: String::from("Authorization"),
+                value: String::from("Manual abc"),
+            },
+        });
+
+        app.apply_action(Action::SetAuthMode(AuthMode::None));
+        assert_eq!(header_value(&app, "Authorization"), Some("Manual abc"));
+    }
+
+    #[tokio::test]
+    async fn switching_auth_mode_clears_irrelevant_credentials() {
+        let mut app = App::new((120, 40));
+
+        app.apply_action(Action::SetAuthMode(AuthMode::Basic));
+        app.apply_action(Action::SetAuthCredentials {
+            username: String::from("alice"),
+            password: String::from("secret"),
+        });
+
+        app.apply_action(Action::SetAuthMode(AuthMode::Bearer));
+        assert_eq!(app.state.request.auth_username, "");
+        assert_eq!(app.state.request.auth_password, "");
+
+        app.apply_action(Action::SetAuthToken(String::from("tkn")));
+        app.apply_action(Action::SetAuthMode(AuthMode::Basic));
+        assert_eq!(app.state.request.auth_token, "");
+
+        app.apply_action(Action::SetAuthCredentials {
+            username: String::from("bob"),
+            password: String::from("pw"),
+        });
+        app.apply_action(Action::SetAuthMode(AuthMode::None));
+        assert_eq!(app.state.request.auth_token, "");
+        assert_eq!(app.state.request.auth_username, "");
+        assert_eq!(app.state.request.auth_password, "");
+    }
+
+    #[tokio::test]
+    async fn empty_auth_inputs_do_not_emit_managed_authorization_header() {
+        let mut app = App::new((120, 40));
+
+        app.apply_action(Action::SetAuthMode(AuthMode::Bearer));
+        app.apply_action(Action::SetAuthToken(String::from("   ")));
+        assert_eq!(header_value(&app, "Authorization"), None);
+
+        app.apply_action(Action::SetAuthMode(AuthMode::Basic));
+        app.apply_action(Action::SetAuthCredentials {
+            username: String::from("   "),
+            password: String::from("password"),
+        });
+        assert_eq!(header_value(&app, "Authorization"), None);
+
+        app.apply_action(Action::SetAuthCredentials {
+            username: String::from("alice"),
+            password: String::new(),
+        });
+        assert_eq!(header_value(&app, "Authorization"), Some("Basic YWxpY2U6"));
+    }
+
+    #[tokio::test]
+    async fn content_type_respects_manual_override_until_format_changes() {
+        let mut app = App::new((120, 40));
+
+        app.apply_action(Action::SetBodyFormat(BodyFormat::Json));
+        assert_eq!(header_value(&app, "Content-Type"), Some("application/json"));
+
+        let content_type_index = app
+            .state
+            .request
+            .headers
+            .iter()
+            .position(|row| row.key.eq_ignore_ascii_case("Content-Type"))
+            .expect("content-type header should exist");
+
+        app.apply_action(Action::SetHeader {
+            index: content_type_index,
+            row: KeyValueRow {
+                enabled: true,
+                key: String::from("Content-Type"),
+                value: String::from("text/plain"),
+            },
+        });
+
+        app.apply_action(Action::SetBodyContent(BodyContent::Json(String::from(
+            "{}",
+        ))));
+        assert_eq!(header_value(&app, "Content-Type"), Some("text/plain"));
+
+        app.apply_action(Action::SetBodyFormat(BodyFormat::Form));
+        assert_eq!(
+            header_value(&app, "Content-Type"),
+            Some("application/x-www-form-urlencoded")
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_header_name_prevents_managed_header_duplicates() {
+        let mut app = App::new((120, 40));
+
+        app.apply_action(Action::AddHeader);
+        app.apply_action(Action::SetHeader {
+            index: 0,
+            row: KeyValueRow {
+                enabled: true,
+                key: String::from("  authorization  "),
+                value: String::from("Manual"),
+            },
+        });
+
+        app.apply_action(Action::SetAuthMode(AuthMode::Bearer));
+        app.apply_action(Action::SetAuthToken(String::from("token")));
+
+        let auth_rows = app
+            .state
+            .request
+            .headers
+            .iter()
+            .filter(|row| canonical_header_name(&row.key) == "authorization")
+            .count();
+        assert_eq!(auth_rows, 1);
+        assert_eq!(header_value(&app, "Authorization"), Some("Bearer token"));
+
+        app.apply_action(Action::SetBodyFormat(BodyFormat::Json));
+        app.apply_action(Action::AddHeader);
+        let next_index = app.state.request.headers.len() - 1;
+        app.apply_action(Action::SetHeader {
+            index: next_index,
+            row: KeyValueRow {
+                enabled: true,
+                key: String::from("\tcontent-type\t"),
+                value: String::from("text/plain"),
+            },
+        });
+
+        app.apply_action(Action::SetBodyContent(BodyContent::Json(String::from(
+            "{}",
+        ))));
+        assert_eq!(header_value(&app, "Content-Type"), Some("text/plain"));
+    }
+
+    fn header_value<'a>(app: &'a App, name: &str) -> Option<&'a str> {
+        app.state
+            .request
+            .headers
+            .iter()
+            .find(|row| canonical_header_name(&row.key) == canonical_header_name(name))
+            .map(|row| row.value.as_str())
     }
 }

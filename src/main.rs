@@ -2,6 +2,8 @@ mod action;
 mod app;
 mod components;
 mod event;
+mod highlight;
+mod http;
 mod state;
 mod tui;
 mod util;

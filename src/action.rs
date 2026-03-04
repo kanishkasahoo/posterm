@@ -1,4 +1,12 @@
-use crate::state::{HttpMethod, KeyValueRow};
+use crate::state::{AuthMode, BodyFormat, HttpMethod, KeyValueRow, ResponseMetadata, ResponseTab};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BodyContent {
+    Json(String),
+    SetFormRow { index: usize, row: KeyValueRow },
+    AddFormRow,
+    RemoveFormRow(usize),
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -12,10 +20,57 @@ pub enum Action {
     SetUrl(String),
     SyncUrlFromParams,
     SyncParamsFromUrl,
-    SetHeader { index: usize, row: KeyValueRow },
+    SetHeader {
+        index: usize,
+        row: KeyValueRow,
+    },
     AddHeader,
     RemoveHeader(usize),
-    SetQueryParam { index: usize, row: KeyValueRow },
+    SetQueryParam {
+        index: usize,
+        row: KeyValueRow,
+    },
     AddQueryParam,
     RemoveQueryParam(usize),
+    SetAuthMode(AuthMode),
+    SetAuthToken(String),
+    SetAuthCredentials {
+        username: String,
+        password: String,
+    },
+    SetBodyFormat(BodyFormat),
+    SetBodyContent(BodyContent),
+    SendRequest,
+    CancelRequest,
+    RequestStarted {
+        request_id: u64,
+        method: HttpMethod,
+        url: String,
+    },
+    RequestCompleted {
+        request_id: u64,
+        metadata: ResponseMetadata,
+    },
+    RequestFailed {
+        request_id: u64,
+        error: String,
+    },
+    RequestCancelled {
+        request_id: u64,
+    },
+    ResponseChunk {
+        request_id: u64,
+        chunk: Vec<u8>,
+    },
+    ScrollResponse(i16),
+    ScrollResponseHorizontal(i16),
+    ToggleResponseWrap,
+    SetResponseTab(ResponseTab),
+    OpenResponseSearch,
+    CloseResponseSearch,
+    SearchInResponse(String),
+    NextSearchMatch,
+    PrevSearchMatch,
+    ToggleHelp,
+    CloseHelp,
 }

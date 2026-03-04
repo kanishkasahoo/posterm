@@ -1,3 +1,5 @@
+mod auth_panel;
+mod body_editor;
 mod headers_editor;
 mod key_value_editor;
 mod query_params;
@@ -7,10 +9,12 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Paragraph, Tabs};
+use ratatui::widgets::{Block, Borders, Tabs};
 
 use crate::action::Action;
 use crate::components::Component;
+use crate::components::request_builder::auth_panel::AuthPanel;
+use crate::components::request_builder::body_editor::BodyEditor;
 use crate::components::request_builder::headers_editor::HeadersEditor;
 use crate::components::request_builder::query_params::QueryParams;
 use crate::components::request_builder::url_bar::UrlBar;
@@ -64,18 +68,8 @@ impl Component for RequestBuilder {
         match request.active_tab {
             RequestTab::Params => QueryParams::render(frame, sections[2], request),
             RequestTab::Headers => HeadersEditor::render(frame, sections[2], request),
-            RequestTab::Auth => {
-                render_placeholder(frame, sections[2], "Auth editor comes in Phase 3")
-            }
-            RequestTab::Body => {
-                render_placeholder(frame, sections[2], "Body editor comes in Phase 3")
-            }
+            RequestTab::Auth => AuthPanel::render(frame, sections[2], request),
+            RequestTab::Body => BodyEditor::render(frame, sections[2], request),
         }
     }
-}
-
-fn render_placeholder(frame: &mut Frame<'_>, area: Rect, message: &str) {
-    let paragraph =
-        Paragraph::new(message).block(Block::default().title("Placeholder").borders(Borders::ALL));
-    frame.render_widget(paragraph, area);
 }
