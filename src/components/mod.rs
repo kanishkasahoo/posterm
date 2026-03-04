@@ -1,7 +1,9 @@
 pub mod help_modal;
 pub mod layout_manager;
+pub mod overlay_manager;
 pub mod request_builder;
 pub mod response_viewer;
+pub mod sidebar;
 pub mod status_bar;
 
 use ratatui::Frame;

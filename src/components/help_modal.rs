@@ -1,14 +1,14 @@
-use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::Frame;
 
 use crate::state::AppState;
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, _state: &AppState) {
-    let modal_width = area.width.saturating_sub(4).clamp(56, 100);
-    let modal_height = area.height.saturating_sub(4).clamp(18, 24);
+    let modal_width = area.width.saturating_sub(4).clamp(60, 100);
+    let modal_height = area.height.saturating_sub(4).clamp(20, 38);
     let modal_area = centered_rect(modal_width, modal_height, area);
 
     frame.render_widget(Clear, modal_area);
@@ -32,7 +32,13 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, _state: &AppState) {
         Line::from("  Ctrl+S         Send request"),
         Line::from("  Ctrl+C         Cancel request"),
         Line::from("  Tab/Shift+Tab  Move request focus"),
-        Line::from("  Esc            Close help or search"),
+        Line::from("  Esc            Close help, search, or sidebar"),
+        Line::from(""),
+        Line::from("Sidebar (Collections & History)"),
+        Line::from("  Ctrl+B         Toggle sidebar (Small/Medium) / focus (Large)"),
+        Line::from("  Up/Down        Navigate items"),
+        Line::from("  Enter/Space    Expand collection or load request/history entry"),
+        Line::from("  Esc            Close / unfocus sidebar"),
         Line::from(""),
         Line::from("Response"),
         Line::from("  Ctrl+F         Open search input"),

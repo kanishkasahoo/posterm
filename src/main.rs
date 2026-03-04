@@ -4,6 +4,7 @@ mod components;
 mod event;
 mod highlight;
 mod http;
+mod persistence;
 mod state;
 mod tui;
 mod util;

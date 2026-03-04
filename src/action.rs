@@ -1,3 +1,4 @@
+use crate::persistence::HistoryEntry;
 use crate::state::{AuthMode, BodyFormat, HttpMethod, KeyValueRow, ResponseMetadata, ResponseTab};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8,6 +9,9 @@ pub enum BodyContent {
     RemoveFormRow(usize),
 }
 
+// The new collection/history/sidebar/persistence variants are part of the Phase 6 API
+// and will be dispatched by future UI components. Allow dead_code on the enum level.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     Tick,
@@ -73,4 +77,47 @@ pub enum Action {
     PrevSearchMatch,
     ToggleHelp,
     CloseHelp,
+
+    // ── Collections ──────────────────────────────────────────────────────────
+    CreateCollection {
+        name: String,
+    },
+    RenameCollection {
+        index: usize,
+        name: String,
+    },
+    DeleteCollection(usize),
+    ToggleCollectionExpanded(usize),
+    SaveRequestToCollection {
+        collection_index: usize,
+        name: String,
+    },
+    RenameCollectionRequest {
+        collection: usize,
+        request: usize,
+        name: String,
+    },
+    DeleteCollectionRequest {
+        collection: usize,
+        request: usize,
+    },
+    LoadCollectionRequest {
+        collection: usize,
+        request: usize,
+    },
+
+    // ── History ───────────────────────────────────────────────────────────────
+    RecordHistory(HistoryEntry),
+    LoadFromHistory(usize),
+    ClearHistory,
+
+    // ── Sidebar navigation ────────────────────────────────────────────────────
+    ToggleSidebar,
+    SidebarFocusNext,
+    SidebarFocusPrev,
+    SidebarSelect,
+    SidebarClose,
+
+    // ── Persistence ───────────────────────────────────────────────────────────
+    PersistenceError(String),
 }

@@ -1,5 +1,6 @@
 use std::fmt;
 
+use crate::persistence::{AppConfig, Collection, HistoryEntry};
 use crate::util::streaming_buffer::StreamingBuffer;
 
 pub const MAX_URL_LENGTH: usize = 2_048;
@@ -543,6 +544,19 @@ impl Default for ResponseState {
     }
 }
 
+/// Identifies which item is currently selected in the sidebar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SidebarItem {
+    /// Nothing selected.
+    None,
+    /// A collection row (index into `AppState.collections`).
+    Collection(usize),
+    /// A request inside a collection.
+    Request { collection: usize, request: usize },
+    /// A history entry (index into `AppState.history`).
+    HistoryEntry(usize),
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct AppState {
     pub terminal_size: (u16, u16),
@@ -551,6 +565,18 @@ pub struct AppState {
     pub help_visible: bool,
     pub request: RequestState,
     pub response: ResponseState,
+    /// Loaded collections.
+    pub collections: Vec<Collection>,
+    /// Request history, newest entry first.
+    pub history: Vec<HistoryEntry>,
+    /// Application configuration.
+    pub config: AppConfig,
+    /// Whether the sidebar is currently visible (relevant for Small/Medium modes).
+    pub sidebar_visible: bool,
+    /// Whether keyboard focus is inside the sidebar.
+    pub sidebar_focused: bool,
+    /// Which item is highlighted in the sidebar.
+    pub sidebar_selected_item: SidebarItem,
 }
 
 impl fmt::Debug for AppState {
@@ -562,6 +588,10 @@ impl fmt::Debug for AppState {
             .field("help_visible", &self.help_visible)
             .field("request", &self.request)
             .field("response", &self.response)
+            .field("collections_count", &self.collections.len())
+            .field("history_count", &self.history.len())
+            .field("sidebar_visible", &self.sidebar_visible)
+            .field("sidebar_focused", &self.sidebar_focused)
             .finish()
     }
 }
@@ -575,6 +605,12 @@ impl AppState {
             help_visible: false,
             request: RequestState::default(),
             response: ResponseState::default(),
+            collections: Vec::new(),
+            history: Vec::new(),
+            config: AppConfig::default(),
+            sidebar_visible: false,
+            sidebar_focused: false,
+            sidebar_selected_item: SidebarItem::None,
         }
     }
 }

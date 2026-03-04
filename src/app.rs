@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -10,21 +10,29 @@ use crate::action::{Action, BodyContent};
 use crate::components::Component;
 use crate::components::help_modal;
 use crate::components::layout_manager::LayoutManager;
+use crate::components::overlay_manager;
 use crate::components::request_builder::RequestBuilder;
 use crate::components::response_viewer::ResponseViewer;
 use crate::components::response_viewer::raw_view::raw_lines;
 use crate::components::response_viewer::response_body::body_search_lines;
 use crate::components::response_viewer::response_headers::header_lines;
+use crate::components::sidebar::Sidebar;
 use crate::components::status_bar::StatusBar;
 use crate::event::{Event, EventHandler};
 use crate::http::client::HttpClientPool;
 use crate::http::execute_request;
+use crate::persistence::{
+    Collection, HistoryEntry, PersistTarget, PersistenceManager, SavedRequest,
+    SerializedKeyValueRow, delete_collection_file, ensure_config_exists, is_sensitive_header,
+    load_all_collections, load_history,
+};
 use crate::state::{
-    AppState, AuthField, AuthMode, BodyField, BodyFormat, InFlightRequest, KeyValueEditorState,
-    KeyValueField, KeyValueRow, MAX_AUTH_PASSWORD_LENGTH, MAX_AUTH_TOKEN_LENGTH,
-    MAX_AUTH_USERNAME_LENGTH, MAX_BODY_FORM_ROWS, MAX_BODY_TEXT_LENGTH, MAX_HEADER_ROWS,
-    MAX_KEY_LENGTH, MAX_QUERY_PARAM_ROWS, MAX_URL_LENGTH, MAX_VALUE_LENGTH, QueryParamToken,
-    RequestTab, ResponseSearchScope, ResponseTab, SearchMatch, SyncDirection,
+    AppState, AuthField, AuthMode, BodyField, BodyFormat, HttpMethod, InFlightRequest,
+    KeyValueEditorState, KeyValueField, KeyValueRow, LayoutMode, SidebarItem,
+    MAX_AUTH_PASSWORD_LENGTH, MAX_AUTH_TOKEN_LENGTH, MAX_AUTH_USERNAME_LENGTH, MAX_BODY_FORM_ROWS,
+    MAX_BODY_TEXT_LENGTH, MAX_HEADER_ROWS, MAX_KEY_LENGTH, MAX_QUERY_PARAM_ROWS, MAX_URL_LENGTH,
+    MAX_VALUE_LENGTH, QueryParamToken, RequestTab, ResponseSearchScope, ResponseTab, SearchMatch,
+    SyncDirection,
 };
 use crate::tui::Tui;
 use crate::util::terminal_sanitize::sanitize_terminal_text;
@@ -36,6 +44,7 @@ pub struct App {
     request_builder: RequestBuilder,
     response_viewer: ResponseViewer,
     status_bar: StatusBar,
+    sidebar: Sidebar,
     http_pool: HttpClientPool,
     action_sender: mpsc::Sender<Action>,
     action_receiver: mpsc::Receiver<Action>,
@@ -43,6 +52,7 @@ pub struct App {
     request_cancel_sender: Option<watch::Sender<bool>>,
     next_request_id: u64,
     pending_response_search_bytes: usize,
+    persistence: PersistenceManager,
 }
 
 const MAX_RESPONSE_SEARCH_QUERY_CHARS: usize = 256;
@@ -52,8 +62,13 @@ const RESPONSE_SEARCH_RECOMPUTE_CHUNK_BYTES: usize = 8 * 1024;
 impl App {
     pub fn new(initial_size: (u16, u16)) -> Self {
         let layout_mode = LayoutManager::mode_for_dimensions(initial_size.0, initial_size.1);
-        let state = AppState::new(initial_size, layout_mode);
+        let mut state = AppState::new(initial_size, layout_mode);
         let (action_sender, action_receiver) = mpsc::channel(256);
+
+        // Load persistent data.
+        state.config = ensure_config_exists();
+        state.collections = load_all_collections();
+        state.history = load_history();
 
         Self {
             state,
@@ -61,6 +76,7 @@ impl App {
             request_builder: RequestBuilder,
             response_viewer: ResponseViewer,
             status_bar: StatusBar,
+            sidebar: Sidebar,
             http_pool: HttpClientPool::new().expect("failed to initialize HTTP client pool"),
             action_sender,
             action_receiver,
@@ -68,6 +84,7 @@ impl App {
             request_cancel_sender: None,
             next_request_id: 1,
             pending_response_search_bytes: 0,
+            persistence: PersistenceManager::new(),
         }
     }
 
@@ -109,6 +126,7 @@ impl App {
         self.request_builder.handle_action(&action, &self.state);
         self.response_viewer.handle_action(&action, &self.state);
         self.status_bar.handle_action(&action, &self.state);
+        self.sidebar.handle_action(&action, &self.state);
 
         if matches!(action, Action::Render) {
             self.render(tui)?;
@@ -124,20 +142,41 @@ impl App {
             const MIN_REQUEST_PANE_WIDTH: u16 = 56;
             const MIN_RESPONSE_PANE_WIDTH: u16 = 72;
             const HORIZONTAL_MIN_WIDTH: u16 = MIN_REQUEST_PANE_WIDTH + MIN_RESPONSE_PANE_WIDTH;
+            const SIDEBAR_WIDTH: u16 = 30;
+
+            let is_large = matches!(self.state.layout_mode, LayoutMode::Large);
+
+            // In Large mode: sidebar | [request + response].
+            // In Small/Medium: full area for request+response; sidebar overlaid when visible.
+            let (content_area, sidebar_area_opt) = if is_large {
+                let chunks = Layout::horizontal([
+                    Constraint::Length(SIDEBAR_WIDTH),
+                    Constraint::Min(HORIZONTAL_MIN_WIDTH),
+                ])
+                .split(pane_layout.main);
+                (chunks[1], Some(chunks[0]))
+            } else {
+                (pane_layout.main, None)
+            };
+
+            // Render inline sidebar in Large mode.
+            if let Some(sidebar_area) = sidebar_area_opt {
+                self.sidebar.render(frame, sidebar_area, &self.state);
+            }
 
             let use_horizontal_split =
-                !matches!(self.state.layout_mode, crate::state::LayoutMode::Small)
-                    && pane_layout.main.width >= HORIZONTAL_MIN_WIDTH;
+                !matches!(self.state.layout_mode, LayoutMode::Small)
+                    && content_area.width >= HORIZONTAL_MIN_WIDTH;
 
             let main_chunks = if use_horizontal_split {
                 Layout::horizontal([
                     Constraint::Min(MIN_REQUEST_PANE_WIDTH),
                     Constraint::Min(MIN_RESPONSE_PANE_WIDTH),
                 ])
-                .split(pane_layout.main)
+                .split(content_area)
             } else {
                 Layout::vertical([Constraint::Percentage(52), Constraint::Percentage(48)])
-                    .split(pane_layout.main)
+                    .split(content_area)
             };
 
             self.request_builder
@@ -146,6 +185,11 @@ impl App {
                 .render(frame, main_chunks[1], &self.state);
             self.status_bar
                 .render(frame, pane_layout.status, &self.state);
+
+            // Overlay sidebar in Small/Medium mode when visible.
+            if !is_large && self.state.sidebar_visible {
+                overlay_manager::render_sidebar_overlay(frame, content_area, &self.state);
+            }
 
             if self.state.help_visible {
                 help_modal::render(frame, pane_layout.main, &self.state);
@@ -188,6 +232,18 @@ impl App {
             return vec![Action::OpenResponseSearch, Action::Render];
         }
 
+        // Ctrl+B toggles sidebar visibility (Small/Medium) or focus (Large).
+        if key_event.code == KeyCode::Char('b')
+            && key_event.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            return vec![Action::ToggleSidebar, Action::Render];
+        }
+
+        // When sidebar is focused, delegate navigation keys to sidebar actions.
+        if self.state.sidebar_focused {
+            return self.handle_sidebar_focused_key(key_event);
+        }
+
         match (key_event.code, key_event.modifiers) {
             (KeyCode::Char('q'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
                 return vec![Action::Quit];
@@ -227,6 +283,17 @@ impl App {
         }
 
         actions
+    }
+
+    /// Handles key events when the sidebar has focus.
+    fn handle_sidebar_focused_key(&self, key_event: KeyEvent) -> Vec<Action> {
+        match key_event.code {
+            KeyCode::Esc => vec![Action::SidebarClose, Action::Render],
+            KeyCode::Up => vec![Action::SidebarFocusPrev, Action::Render],
+            KeyCode::Down => vec![Action::SidebarFocusNext, Action::Render],
+            KeyCode::Enter | KeyCode::Char(' ') => vec![Action::SidebarSelect, Action::Render],
+            _ => Vec::new(),
+        }
     }
 
     fn is_help_shortcut(key_event: KeyEvent) -> bool {
@@ -1196,7 +1263,10 @@ impl App {
 
     fn apply_action(&mut self, action: Action) {
         match action {
-            Action::Tick | Action::Render => {}
+            Action::Tick => {
+                self.persistence.flush_pending(&self.state);
+            }
+            Action::Render => {}
             Action::Resize(width, height) => {
                 self.state.terminal_size = (width, height);
                 self.state.layout_mode = LayoutManager::mode_for_dimensions(width, height);
@@ -1494,7 +1564,7 @@ impl App {
             } => {
                 if self.state.response.last_request_id == Some(request_id) {
                     metadata.truncated = self.state.response.truncated;
-                    self.state.response.metadata = Some(metadata);
+                    self.state.response.metadata = Some(metadata.clone());
                     self.state.response.in_flight = None;
                     self.state.response.cancelled = false;
                     let max_scroll = response_scroll_upper_bound(&self.state.response);
@@ -1502,6 +1572,27 @@ impl App {
                         self.state.response.scroll_offset.min(max_scroll);
                     self.recompute_response_search();
                     self.clear_runtime_request_handles();
+
+                    // Auto-record to history.
+                    let timestamp_secs = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let entry = HistoryEntry {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        timestamp_secs,
+                        method: self.state.request.method.as_str().to_string(),
+                        url: self.state.request.url.clone(),
+                        status_code: metadata.status_code,
+                        elapsed_ms: Some(metadata.duration_ms),
+                        request: Some(snapshot_request(
+                            &self.state.request,
+                            self.state.config.persist_sensitive_headers,
+                        )),
+                    };
+                    self.state.history.insert(0, entry);
+                    self.state.history.truncate(self.state.config.history_limit);
+                    self.persistence.schedule_save(PersistTarget::History);
                 }
             }
             Action::RequestFailed { request_id, error } => {
@@ -1644,6 +1735,190 @@ impl App {
             Action::CloseHelp => {
                 self.state.help_visible = false;
             }
+
+            // ── Collections ──────────────────────────────────────────────────
+            Action::CreateCollection { name } => {
+                let id = uuid::Uuid::new_v4().to_string();
+                let col = Collection {
+                    id: id.clone(),
+                    name,
+                    expanded: true,
+                    requests: Vec::new(),
+                };
+                self.state.collections.push(col);
+                self.persistence
+                    .schedule_save(PersistTarget::Collection(id));
+            }
+            Action::RenameCollection { index, name } => {
+                if let Some(col) = self.state.collections.get_mut(index) {
+                    col.name = name;
+                    let id = col.id.clone();
+                    self.persistence
+                        .schedule_save(PersistTarget::Collection(id));
+                }
+            }
+            Action::DeleteCollection(index) => {
+                if index < self.state.collections.len() {
+                    let col = self.state.collections.remove(index);
+                    let _ = delete_collection_file(&col.id);
+                    // Reset sidebar selection if it pointed into this collection.
+                    match &self.state.sidebar_selected_item {
+                        SidebarItem::Collection(i) if *i == index => {
+                            self.state.sidebar_selected_item = SidebarItem::None;
+                        }
+                        SidebarItem::Request { collection, .. } if *collection == index => {
+                            self.state.sidebar_selected_item = SidebarItem::None;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Action::ToggleCollectionExpanded(index) => {
+                if let Some(col) = self.state.collections.get_mut(index) {
+                    col.expanded = !col.expanded;
+                }
+            }
+            Action::SaveRequestToCollection {
+                collection_index,
+                name,
+            } => {
+                if let Some(col) = self.state.collections.get_mut(collection_index) {
+                    let mut saved = snapshot_request(
+                        &self.state.request,
+                        self.state.config.persist_sensitive_headers,
+                    );
+                    saved.name = name;
+                    col.requests.push(saved);
+                    let id = col.id.clone();
+                    self.persistence
+                        .schedule_save(PersistTarget::Collection(id));
+                }
+            }
+            Action::RenameCollectionRequest {
+                collection,
+                request,
+                name,
+            } => {
+                if let Some(col) = self.state.collections.get_mut(collection) {
+                    if let Some(req) = col.requests.get_mut(request) {
+                        req.name = name;
+                        let id = col.id.clone();
+                        self.persistence
+                            .schedule_save(PersistTarget::Collection(id));
+                    }
+                }
+            }
+            Action::DeleteCollectionRequest { collection, request } => {
+                if let Some(col) = self.state.collections.get_mut(collection) {
+                    if request < col.requests.len() {
+                        col.requests.remove(request);
+                        let id = col.id.clone();
+                        self.persistence
+                            .schedule_save(PersistTarget::Collection(id));
+                    }
+                }
+                // Reset sidebar selection if it pointed at the deleted request.
+                match &self.state.sidebar_selected_item {
+                    SidebarItem::Request {
+                        collection: c,
+                        request: r,
+                    } if *c == collection && *r == request => {
+                        self.state.sidebar_selected_item = SidebarItem::Collection(collection);
+                    }
+                    _ => {}
+                }
+            }
+            Action::LoadCollectionRequest { collection, request } => {
+                let saved = self
+                    .state
+                    .collections
+                    .get(collection)
+                    .and_then(|col| col.requests.get(request))
+                    .cloned();
+                if let Some(saved) = saved {
+                    load_saved_request_into_state(&mut self.state.request, &saved);
+                }
+            }
+
+            // ── History ───────────────────────────────────────────────────────
+            Action::RecordHistory(entry) => {
+                self.state.history.insert(0, entry);
+                self.state.history.truncate(self.state.config.history_limit);
+                self.persistence.schedule_save(PersistTarget::History);
+            }
+            Action::LoadFromHistory(index) => {
+                let saved = self
+                    .state
+                    .history
+                    .get(index)
+                    .and_then(|e| e.request.as_ref())
+                    .cloned();
+                if let Some(saved) = saved {
+                    load_saved_request_into_state(&mut self.state.request, &saved);
+                }
+            }
+            Action::ClearHistory => {
+                self.state.history.clear();
+                self.persistence.schedule_save(PersistTarget::History);
+            }
+
+            // ── Sidebar navigation ────────────────────────────────────────────
+            Action::ToggleSidebar => {
+                if matches!(self.state.layout_mode, LayoutMode::Large) {
+                    // Sidebar is always visible in Large; toggle focus instead.
+                    self.state.sidebar_focused = !self.state.sidebar_focused;
+                } else {
+                    self.state.sidebar_visible = !self.state.sidebar_visible;
+                    if !self.state.sidebar_visible {
+                        self.state.sidebar_focused = false;
+                    } else {
+                        self.state.sidebar_focused = true;
+                    }
+                }
+            }
+            Action::SidebarFocusNext => {
+                self.sidebar_navigate(1);
+            }
+            Action::SidebarFocusPrev => {
+                self.sidebar_navigate(-1);
+            }
+            Action::SidebarSelect => {
+                match self.state.sidebar_selected_item.clone() {
+                    SidebarItem::Collection(idx) => {
+                        self.apply_action(Action::ToggleCollectionExpanded(idx));
+                    }
+                    SidebarItem::Request { collection, request } => {
+                        self.apply_action(Action::LoadCollectionRequest {
+                            collection,
+                            request,
+                        });
+                        // Close/defocus sidebar after loading.
+                        self.state.sidebar_focused = false;
+                        if !matches!(self.state.layout_mode, LayoutMode::Large) {
+                            self.state.sidebar_visible = false;
+                        }
+                    }
+                    SidebarItem::HistoryEntry(idx) => {
+                        self.apply_action(Action::LoadFromHistory(idx));
+                        self.state.sidebar_focused = false;
+                        if !matches!(self.state.layout_mode, LayoutMode::Large) {
+                            self.state.sidebar_visible = false;
+                        }
+                    }
+                    SidebarItem::None => {}
+                }
+            }
+            Action::SidebarClose => {
+                self.state.sidebar_focused = false;
+                if !matches!(self.state.layout_mode, LayoutMode::Large) {
+                    self.state.sidebar_visible = false;
+                }
+            }
+
+            // ── Persistence ───────────────────────────────────────────────────
+            Action::PersistenceError(msg) => {
+                eprintln!("[posterm] persistence error: {msg}");
+            }
         }
     }
 
@@ -1686,6 +1961,190 @@ impl App {
             return;
         };
         self.state.response.scroll_offset = entry.line_index;
+    }
+
+    /// Moves sidebar selection by `delta` (+1 = down, -1 = up) through the
+    /// flat list of visible sidebar items.
+    fn sidebar_navigate(&mut self, delta: i32) {
+        // Build the flat ordered list of selectable items (same ordering as the
+        // renderer uses).
+        let mut items: Vec<SidebarItem> = Vec::new();
+        for (col_idx, col) in self.state.collections.iter().enumerate() {
+            items.push(SidebarItem::Collection(col_idx));
+            if col.expanded {
+                for req_idx in 0..col.requests.len() {
+                    items.push(SidebarItem::Request {
+                        collection: col_idx,
+                        request: req_idx,
+                    });
+                }
+            }
+        }
+        for hist_idx in 0..self.state.history.len() {
+            items.push(SidebarItem::HistoryEntry(hist_idx));
+        }
+
+        if items.is_empty() {
+            return;
+        }
+
+        let current_pos = items
+            .iter()
+            .position(|item| *item == self.state.sidebar_selected_item)
+            .unwrap_or(0);
+
+        let next_pos = if delta > 0 {
+            (current_pos + delta as usize).min(items.len() - 1)
+        } else {
+            current_pos.saturating_sub(delta.unsigned_abs() as usize)
+        };
+
+        self.state.sidebar_selected_item = items[next_pos].clone();
+    }
+}
+
+// ── Phase 6 helper functions ──────────────────────────────────────────────────
+
+/// Creates a [`SavedRequest`] snapshot from the current [`RequestState`].
+///
+/// When `persist_sensitive` is `false`, sensitive header values are replaced
+/// with `"[REDACTED]"` and auth credentials are cleared.
+fn snapshot_request(
+    req: &crate::state::RequestState,
+    persist_sensitive: bool,
+) -> SavedRequest {
+    let mut headers: Vec<SerializedKeyValueRow> = req
+        .headers
+        .iter()
+        .map(|row| SerializedKeyValueRow {
+            key: row.key.clone(),
+            value: row.value.clone(),
+            enabled: row.enabled,
+        })
+        .collect();
+
+    if !persist_sensitive {
+        for h in &mut headers {
+            if is_sensitive_header(&h.key) {
+                h.value = String::from("[REDACTED]");
+            }
+        }
+    }
+
+    SavedRequest {
+        id: uuid::Uuid::new_v4().to_string(),
+        name: String::new(),
+        method: req.method.as_str().to_string(),
+        url: req.url.clone(),
+        query_params: req
+            .query_params
+            .iter()
+            .map(|r| SerializedKeyValueRow {
+                key: r.key.clone(),
+                value: r.value.clone(),
+                enabled: r.enabled,
+            })
+            .collect(),
+        headers,
+        auth_mode: req.auth_mode.as_str().to_string(),
+        auth_token: if persist_sensitive {
+            req.auth_token.clone()
+        } else {
+            String::new()
+        },
+        auth_username: if persist_sensitive {
+            req.auth_username.clone()
+        } else {
+            String::new()
+        },
+        auth_password: if persist_sensitive {
+            req.auth_password.clone()
+        } else {
+            String::new()
+        },
+        body_format: req.body_format.as_str().to_string(),
+        body_json: req.body_json.clone(),
+        body_form: req.body_form.iter().map(|r| SerializedKeyValueRow {
+            key: r.key.clone(),
+            value: r.value.clone(),
+            enabled: r.enabled,
+        }).collect(),
+    }
+}
+
+/// Loads a [`SavedRequest`] snapshot into `state`, overwriting the current
+/// request fields.
+fn load_saved_request_into_state(state: &mut crate::state::RequestState, saved: &SavedRequest) {
+    state.method = http_method_from_str(&saved.method);
+    state.url = saved.url.clone();
+    state.url_cursor = state.url.chars().count();
+    state.query_params = saved
+        .query_params
+        .iter()
+        .map(|r| KeyValueRow {
+            key: r.key.clone(),
+            value: r.value.clone(),
+            enabled: r.enabled,
+        })
+        .collect();
+    state.query_param_tokens = state
+        .query_params
+        .iter()
+        .map(|_| QueryParamToken::KeyValue)
+        .collect();
+    state.headers = saved
+        .headers
+        .iter()
+        .map(|r| KeyValueRow {
+            key: r.key.clone(),
+            value: r.value.clone(),
+            enabled: r.enabled,
+        })
+        .collect();
+    state.auth_mode = auth_mode_from_str(&saved.auth_mode);
+    state.auth_token = saved.auth_token.clone();
+    state.auth_username = saved.auth_username.clone();
+    state.auth_password = saved.auth_password.clone();
+    state.body_format = body_format_from_str(&saved.body_format);
+    state.body_json = saved.body_json.clone();
+    state.body_form = saved
+        .body_form
+        .iter()
+        .map(|r| KeyValueRow {
+            key: r.key.clone(),
+            value: r.value.clone(),
+            enabled: r.enabled,
+        })
+        .collect();
+    // Reset cursor / editor state so UX is clean after load.
+    state.query_editor = KeyValueEditorState::default();
+    state.headers_editor = KeyValueEditorState::default();
+}
+
+fn http_method_from_str(s: &str) -> HttpMethod {
+    match s {
+        "POST" => HttpMethod::Post,
+        "PUT" => HttpMethod::Put,
+        "PATCH" => HttpMethod::Patch,
+        "DELETE" => HttpMethod::Delete,
+        "HEAD" => HttpMethod::Head,
+        "OPTIONS" => HttpMethod::Options,
+        _ => HttpMethod::Get,
+    }
+}
+
+fn auth_mode_from_str(s: &str) -> AuthMode {
+    match s {
+        "Bearer" => AuthMode::Bearer,
+        "Basic" => AuthMode::Basic,
+        _ => AuthMode::None,
+    }
+}
+
+fn body_format_from_str(s: &str) -> BodyFormat {
+    match s {
+        "Form" => BodyFormat::Form,
+        _ => BodyFormat::Json,
     }
 }
 
@@ -2800,5 +3259,104 @@ mod tests {
             .iter()
             .find(|row| canonical_header_name(&row.key) == canonical_header_name(name))
             .map(|row| row.value.as_str())
+    }
+
+    // ── Phase 6: snapshot / round-trip tests ─────────────────────────────────
+
+    #[test]
+    fn snapshot_request_round_trips_method_url_and_body() {
+        use super::{load_saved_request_into_state, snapshot_request};
+        use crate::state::{HttpMethod, RequestState};
+
+        let mut req = RequestState::default();
+        req.method = HttpMethod::Post;
+        req.url = String::from("https://api.example.com/items");
+        req.body_format = BodyFormat::Json;
+        req.body_json = String::from(r#"{"key":"value"}"#);
+
+        let saved = snapshot_request(&req, true);
+        assert_eq!(saved.method, "POST");
+        assert_eq!(saved.url, "https://api.example.com/items");
+        assert_eq!(saved.body_json, r#"{"key":"value"}"#);
+
+        let mut restored = RequestState::default();
+        load_saved_request_into_state(&mut restored, &saved);
+        assert_eq!(restored.method, HttpMethod::Post);
+        assert_eq!(restored.url, "https://api.example.com/items");
+        assert_eq!(restored.body_json, r#"{"key":"value"}"#);
+    }
+
+    #[test]
+    fn snapshot_request_redacts_sensitive_headers_when_persist_false() {
+        use super::snapshot_request;
+        use crate::state::{HttpMethod, KeyValueRow, RequestState};
+
+        let mut req = RequestState::default();
+        req.method = HttpMethod::Get;
+        req.url = String::from("https://example.com");
+        req.headers = vec![
+            KeyValueRow {
+                key: String::from("Authorization"),
+                value: String::from("Bearer top-secret"),
+                enabled: true,
+            },
+            KeyValueRow {
+                key: String::from("Accept"),
+                value: String::from("application/json"),
+                enabled: true,
+            },
+        ];
+        req.auth_token = String::from("top-secret");
+        req.auth_username = String::from("admin");
+        req.auth_password = String::from("password");
+
+        let saved = snapshot_request(&req, false);
+
+        let auth_header = saved.headers.iter().find(|h| h.key == "Authorization").unwrap();
+        let accept_header = saved.headers.iter().find(|h| h.key == "Accept").unwrap();
+
+        assert_eq!(auth_header.value, "[REDACTED]");
+        assert_eq!(accept_header.value, "application/json");
+        assert!(saved.auth_token.is_empty());
+        assert!(saved.auth_username.is_empty());
+        assert!(saved.auth_password.is_empty());
+    }
+
+    #[test]
+    fn snapshot_request_preserves_sensitive_fields_when_persist_true() {
+        use super::snapshot_request;
+        use crate::state::{AuthMode, HttpMethod, KeyValueRow, RequestState};
+
+        let mut req = RequestState::default();
+        req.method = HttpMethod::Get;
+        req.url = String::from("https://example.com");
+        req.auth_mode = AuthMode::Bearer;
+        req.auth_token = String::from("my-token");
+        req.headers = vec![KeyValueRow {
+            key: String::from("Cookie"),
+            value: String::from("session=abc"),
+            enabled: true,
+        }];
+
+        let saved = snapshot_request(&req, true);
+
+        let cookie = saved.headers.iter().find(|h| h.key == "Cookie").unwrap();
+        assert_eq!(cookie.value, "session=abc");
+        assert_eq!(saved.auth_token, "my-token");
+    }
+
+    #[test]
+    fn load_saved_request_resets_url_cursor_to_end() {
+        use super::{load_saved_request_into_state, snapshot_request};
+        use crate::state::RequestState;
+
+        let mut req = RequestState::default();
+        req.url = String::from("https://example.com/path");
+        let saved = snapshot_request(&req, true);
+
+        let mut target = RequestState::default();
+        load_saved_request_into_state(&mut target, &saved);
+
+        assert_eq!(target.url_cursor, target.url.chars().count());
     }
 }

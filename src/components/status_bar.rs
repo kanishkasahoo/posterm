@@ -1,7 +1,7 @@
-use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
+use ratatui::Frame;
 
 use crate::action::Action;
 use crate::components::Component;
