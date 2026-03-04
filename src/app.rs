@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
@@ -29,11 +29,11 @@ use crate::persistence::{
 };
 use crate::state::{
     AppState, AuthField, AuthMode, BodyField, BodyFormat, HttpMethod, InFlightRequest,
-    KeyValueEditorState, KeyValueField, KeyValueRow, LayoutMode, SidebarItem,
-    MAX_AUTH_PASSWORD_LENGTH, MAX_AUTH_TOKEN_LENGTH, MAX_AUTH_USERNAME_LENGTH, MAX_BODY_FORM_ROWS,
-    MAX_BODY_TEXT_LENGTH, MAX_HEADER_ROWS, MAX_KEY_LENGTH, MAX_QUERY_PARAM_ROWS, MAX_URL_LENGTH,
-    MAX_VALUE_LENGTH, QueryParamToken, RequestTab, ResponseSearchScope, ResponseTab, SearchMatch,
-    SyncDirection,
+    KeyValueEditorState, KeyValueField, KeyValueRow, LayoutMode, MAX_AUTH_PASSWORD_LENGTH,
+    MAX_AUTH_TOKEN_LENGTH, MAX_AUTH_USERNAME_LENGTH, MAX_BODY_FORM_ROWS, MAX_BODY_TEXT_LENGTH,
+    MAX_HEADER_ROWS, MAX_KEY_LENGTH, MAX_QUERY_PARAM_ROWS, MAX_URL_LENGTH, MAX_VALUE_LENGTH,
+    QueryParamToken, RequestTab, ResponseSearchScope, ResponseTab, SearchMatch, SidebarItem,
+    SidebarPromptMode, SidebarPromptState, SyncDirection,
 };
 use crate::tui::Tui;
 use crate::util::terminal_sanitize::sanitize_terminal_text;
@@ -171,15 +171,16 @@ impl App {
             }
 
             let is_small = matches!(self.state.layout_mode, LayoutMode::Small);
-            let use_horizontal_split =
-                !is_small && content_area.width >= HORIZONTAL_MIN_WIDTH;
+            let use_horizontal_split = !is_small && content_area.width >= HORIZONTAL_MIN_WIDTH;
 
             if is_small {
                 // In Small mode: show only one pane at a time (full content_area).
                 if self.state.small_mode_show_response {
-                    self.response_viewer.render(frame, content_area, &self.state);
+                    self.response_viewer
+                        .render(frame, content_area, &self.state);
                 } else {
-                    self.request_builder.render(frame, content_area, &self.state);
+                    self.request_builder
+                        .render(frame, content_area, &self.state);
                 }
             } else {
                 let main_chunks = if use_horizontal_split {
@@ -332,12 +333,107 @@ impl App {
     }
 
     /// Handles key events when the sidebar has focus.
-    fn handle_sidebar_focused_key(&self, key_event: KeyEvent) -> Vec<Action> {
+    fn handle_sidebar_focused_key(&mut self, key_event: KeyEvent) -> Vec<Action> {
+        if self.state.sidebar_prompt.is_some() {
+            return self.handle_sidebar_prompt_key(key_event);
+        }
+
         match key_event.code {
             KeyCode::Esc => vec![Action::SidebarClose, Action::Render],
             KeyCode::Up => vec![Action::SidebarFocusPrev, Action::Render],
             KeyCode::Down => vec![Action::SidebarFocusNext, Action::Render],
+            KeyCode::Left => {
+                vec![Action::SidebarScrollCollectionsHorizontal(-2), Action::Render]
+            }
+            KeyCode::Right => {
+                vec![Action::SidebarScrollCollectionsHorizontal(2), Action::Render]
+            }
             KeyCode::Enter | KeyCode::Char(' ') => vec![Action::SidebarSelect, Action::Render],
+            KeyCode::Char('c') if key_event.modifiers.is_empty() => {
+                self.start_sidebar_prompt(SidebarPromptMode::CreateCollection, String::new());
+                vec![Action::Render]
+            }
+            KeyCode::Char('r') if key_event.modifiers.is_empty() => {
+                match self.selected_sidebar_rename_prompt() {
+                    Some((mode, current_name)) => {
+                        self.start_sidebar_prompt(mode, current_name);
+                        vec![Action::Render]
+                    }
+                    None => vec![
+                        Action::ShowNotification {
+                            message: String::from("Select a collection or saved request to rename"),
+                            kind: crate::state::NotificationKind::Error,
+                        },
+                        Action::Render,
+                    ],
+                }
+            }
+            KeyCode::Char('s') if key_event.modifiers.is_empty() => {
+                match self.selected_collection_for_save() {
+                    Some(collection_index) => {
+                        let default_name = default_saved_request_name(&self.state.request);
+                        self.start_sidebar_prompt(
+                            SidebarPromptMode::SaveRequestToCollection { collection_index },
+                            default_name,
+                        );
+                        vec![Action::Render]
+                    }
+                    None => vec![
+                        Action::ShowNotification {
+                            message: String::from(
+                                "Select a collection to save the current request",
+                            ),
+                            kind: crate::state::NotificationKind::Error,
+                        },
+                        Action::Render,
+                    ],
+                }
+            }
+            KeyCode::Char('d') if key_event.modifiers.is_empty() => {
+                self.delete_selected_sidebar_item_actions()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn handle_sidebar_prompt_key(&mut self, key_event: KeyEvent) -> Vec<Action> {
+        let Some(prompt_mode) = self
+            .state
+            .sidebar_prompt
+            .as_ref()
+            .map(|prompt| prompt.mode.clone())
+        else {
+            return Vec::new();
+        };
+
+        match key_event.code {
+            KeyCode::Esc => {
+                let cancelled = prompt_mode.cancel_label().to_string();
+                self.state.sidebar_prompt = None;
+                vec![
+                    Action::ShowNotification {
+                        message: format!("{cancelled} cancelled"),
+                        kind: crate::state::NotificationKind::Info,
+                    },
+                    Action::Render,
+                ]
+            }
+            KeyCode::Enter => self.confirm_sidebar_prompt(),
+            KeyCode::Backspace => {
+                if let Some(prompt) = self.state.sidebar_prompt.as_mut() {
+                    prompt.value.pop();
+                }
+                vec![Action::Render]
+            }
+            KeyCode::Char(ch)
+                if !key_event.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key_event.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                if let Some(prompt) = self.state.sidebar_prompt.as_mut() {
+                    prompt.value.push(ch);
+                }
+                vec![Action::Render]
+            }
             _ => Vec::new(),
         }
     }
@@ -1322,18 +1418,22 @@ impl App {
         let pool = self.http_pool.clone();
         let (cancel_sender, mut cancel_receiver) = watch::channel(false);
 
-        self.request_cancel_senders.insert(request_id, cancel_sender);
-        self.request_tasks.insert(request_id, tokio::spawn(async move {
-            let _ = execute_request(
-                &pool,
-                &request_state,
-                request_id,
-                false,
-                &mut cancel_receiver,
-                &action_sender,
-            )
-            .await;
-        }));
+        self.request_cancel_senders
+            .insert(request_id, cancel_sender);
+        self.request_tasks.insert(
+            request_id,
+            tokio::spawn(async move {
+                let _ = execute_request(
+                    &pool,
+                    &request_state,
+                    request_id,
+                    false,
+                    &mut cancel_receiver,
+                    &action_sender,
+                )
+                .await;
+            }),
+        );
     }
 
     /// Cancel only the active response context's in-flight request.
@@ -1634,8 +1734,7 @@ impl App {
             Action::SendRequest => {
                 let url = self.state.request.url.trim().to_string();
                 if url.is_empty() {
-                    self.state.request.url_error =
-                        Some(String::from("URL cannot be empty"));
+                    self.state.request.url_error = Some(String::from("URL cannot be empty"));
                     self.state.notification = Some((
                         String::from("URL cannot be empty — set a URL before sending"),
                         crate::state::NotificationKind::Error,
@@ -1676,7 +1775,9 @@ impl App {
                     url: url.clone(),
                     cancellation_requested: false,
                 };
-                self.state.in_flight_requests.insert(request_id, record.clone());
+                self.state
+                    .in_flight_requests
+                    .insert(request_id, record.clone());
                 if self.active_response_id == Some(request_id) {
                     self.state.response.last_request_id = Some(request_id);
                     self.state.response.in_flight = Some(record);
@@ -1891,13 +1992,14 @@ impl App {
                 self.state.help_scroll = 0;
             }
             Action::ScrollHelp(delta) => {
-                // Max lines in the help content (keep in sync with help_modal.rs line count).
-                const HELP_CONTENT_LINES: usize = 34;
-                let visible = self.state.terminal_size.1.saturating_sub(6) as usize;
-                let max_scroll = HELP_CONTENT_LINES.saturating_sub(visible);
+                let terminal_area =
+                    Rect::new(0, 0, self.state.terminal_size.0, self.state.terminal_size.1);
+                let main_area = LayoutManager::compute(terminal_area).main;
+                let max_scroll =
+                    help_modal::max_scroll_for_area(main_area, help_modal::line_count());
                 if delta < 0 {
                     self.state.help_scroll =
-                        self.state.help_scroll.saturating_sub((-delta) as usize);
+                        self.state.help_scroll.saturating_sub(delta.unsigned_abs() as usize);
                 } else {
                     self.state.help_scroll =
                         (self.state.help_scroll + delta as usize).min(max_scroll);
@@ -1976,7 +2078,10 @@ impl App {
                         .schedule_save(PersistTarget::Collection(id));
                 }
             }
-            Action::DeleteCollectionRequest { collection, request } => {
+            Action::DeleteCollectionRequest {
+                collection,
+                request,
+            } => {
                 if let Some(col) = self.state.collections.get_mut(collection)
                     && request < col.requests.len()
                 {
@@ -1996,7 +2101,10 @@ impl App {
                     _ => {}
                 }
             }
-            Action::LoadCollectionRequest { collection, request } => {
+            Action::LoadCollectionRequest {
+                collection,
+                request,
+            } => {
                 let saved = self
                     .state
                     .collections
@@ -2035,9 +2143,15 @@ impl App {
                 if matches!(self.state.layout_mode, LayoutMode::Large) {
                     // Sidebar is always visible in Large; toggle focus instead.
                     self.state.sidebar_focused = !self.state.sidebar_focused;
+                    if !self.state.sidebar_focused {
+                        self.state.sidebar_prompt = None;
+                    }
                 } else {
                     self.state.sidebar_visible = !self.state.sidebar_visible;
                     self.state.sidebar_focused = self.state.sidebar_visible;
+                    if !self.state.sidebar_visible {
+                        self.state.sidebar_prompt = None;
+                    }
                 }
             }
             Action::ToggleSmallModePane => {
@@ -2049,12 +2163,18 @@ impl App {
             Action::SidebarFocusPrev => {
                 self.sidebar_navigate(-1);
             }
+            Action::SidebarScrollCollectionsHorizontal(delta) => {
+                self.scroll_sidebar_horizontal(delta);
+            }
             Action::SidebarSelect => {
                 match self.state.sidebar_selected_item.clone() {
                     SidebarItem::Collection(idx) => {
                         self.apply_action(Action::ToggleCollectionExpanded(idx));
                     }
-                    SidebarItem::Request { collection, request } => {
+                    SidebarItem::Request {
+                        collection,
+                        request,
+                    } => {
                         self.apply_action(Action::LoadCollectionRequest {
                             collection,
                             request,
@@ -2077,6 +2197,7 @@ impl App {
             }
             Action::SidebarClose => {
                 self.state.sidebar_focused = false;
+                self.state.sidebar_prompt = None;
                 if !matches!(self.state.layout_mode, LayoutMode::Large) {
                     self.state.sidebar_visible = false;
                 }
@@ -2085,14 +2206,16 @@ impl App {
             // ── Persistence ───────────────────────────────────────────────────
             Action::PersistenceError(msg) => {
                 eprintln!("[posterm] persistence error: {msg}");
-                self.state.notification =
-                    Some((msg, crate::state::NotificationKind::Error));
+                self.state.notification = Some((
+                    sanitize_terminal_text(&msg),
+                    crate::state::NotificationKind::Error,
+                ));
                 self.state.notification_ticks_remaining = 50;
             }
 
             // ── Notifications ─────────────────────────────────────────────────
             Action::ShowNotification { message, kind } => {
-                self.state.notification = Some((message, kind));
+                self.state.notification = Some((sanitize_terminal_text(&message), kind));
                 self.state.notification_ticks_remaining = 50;
             }
             Action::DismissNotification => {
@@ -2181,18 +2304,237 @@ impl App {
 
         self.state.sidebar_selected_item = items[next_pos].clone();
     }
+
+    fn scroll_sidebar_horizontal(&mut self, delta: i16) {
+        let offset = match self.state.sidebar_selected_item {
+            SidebarItem::HistoryEntry(_) => &mut self.state.sidebar_history_horizontal_offset,
+            SidebarItem::Collection(_) | SidebarItem::Request { .. } | SidebarItem::None => {
+                &mut self.state.sidebar_collections_horizontal_offset
+            }
+        };
+
+        if delta >= 0 {
+            *offset = offset.saturating_add(delta as usize);
+        } else {
+            *offset = offset.saturating_sub(delta.unsigned_abs() as usize);
+        }
+    }
+
+    fn start_sidebar_prompt(&mut self, mode: SidebarPromptMode, value: String) {
+        self.state.sidebar_prompt = Some(SidebarPromptState { mode, value });
+    }
+
+    fn selected_sidebar_rename_prompt(&self) -> Option<(SidebarPromptMode, String)> {
+        match self.state.sidebar_selected_item {
+            SidebarItem::Collection(index) => self.state.collections.get(index).map(|col| {
+                (
+                    SidebarPromptMode::RenameCollection { index },
+                    col.name.clone(),
+                )
+            }),
+            SidebarItem::Request {
+                collection,
+                request,
+            } => self
+                .state
+                .collections
+                .get(collection)
+                .and_then(|col| col.requests.get(request))
+                .map(|req| {
+                    (
+                        SidebarPromptMode::RenameCollectionRequest {
+                            collection,
+                            request,
+                        },
+                        req.name.clone(),
+                    )
+                }),
+            _ => None,
+        }
+    }
+
+    fn selected_collection_for_save(&self) -> Option<usize> {
+        match self.state.sidebar_selected_item {
+            SidebarItem::Collection(index) => Some(index),
+            SidebarItem::Request { collection, .. } => Some(collection),
+            SidebarItem::HistoryEntry(_) | SidebarItem::None => None,
+        }
+    }
+
+    fn confirm_sidebar_prompt(&mut self) -> Vec<Action> {
+        let Some(prompt) = self.state.sidebar_prompt.clone() else {
+            return Vec::new();
+        };
+
+        let name = prompt.value.trim().to_string();
+        if name.is_empty() {
+            return vec![
+                Action::ShowNotification {
+                    message: String::from("Name cannot be empty"),
+                    kind: crate::state::NotificationKind::Error,
+                },
+                Action::Render,
+            ];
+        }
+
+        let mut actions = Vec::new();
+        match prompt.mode {
+            SidebarPromptMode::CreateCollection => {
+                actions.push(Action::CreateCollection { name: name.clone() });
+                actions.push(Action::ShowNotification {
+                    message: format!("Created collection '{name}'"),
+                    kind: crate::state::NotificationKind::Info,
+                });
+            }
+            SidebarPromptMode::RenameCollection { index } => {
+                if self.state.collections.get(index).is_none() {
+                    actions.push(Action::ShowNotification {
+                        message: String::from("Collection no longer exists"),
+                        kind: crate::state::NotificationKind::Error,
+                    });
+                } else {
+                    actions.push(Action::RenameCollection {
+                        index,
+                        name: name.clone(),
+                    });
+                    actions.push(Action::ShowNotification {
+                        message: format!("Renamed collection to '{name}'"),
+                        kind: crate::state::NotificationKind::Info,
+                    });
+                }
+            }
+            SidebarPromptMode::SaveRequestToCollection { collection_index } => {
+                if self.state.collections.get(collection_index).is_none() {
+                    actions.push(Action::ShowNotification {
+                        message: String::from("Collection no longer exists"),
+                        kind: crate::state::NotificationKind::Error,
+                    });
+                } else {
+                    actions.push(Action::SaveRequestToCollection {
+                        collection_index,
+                        name: name.clone(),
+                    });
+                    actions.push(Action::ShowNotification {
+                        message: format!("Saved current request as '{name}'"),
+                        kind: crate::state::NotificationKind::Info,
+                    });
+                }
+            }
+            SidebarPromptMode::RenameCollectionRequest {
+                collection,
+                request,
+            } => {
+                let exists = self
+                    .state
+                    .collections
+                    .get(collection)
+                    .and_then(|col| col.requests.get(request))
+                    .is_some();
+                if !exists {
+                    actions.push(Action::ShowNotification {
+                        message: String::from("Saved request no longer exists"),
+                        kind: crate::state::NotificationKind::Error,
+                    });
+                } else {
+                    actions.push(Action::RenameCollectionRequest {
+                        collection,
+                        request,
+                        name: name.clone(),
+                    });
+                    actions.push(Action::ShowNotification {
+                        message: format!("Renamed saved request to '{name}'"),
+                        kind: crate::state::NotificationKind::Info,
+                    });
+                }
+            }
+        }
+
+        self.state.sidebar_prompt = None;
+        actions.push(Action::Render);
+        actions
+    }
+
+    fn delete_selected_sidebar_item_actions(&self) -> Vec<Action> {
+        match self.state.sidebar_selected_item {
+            SidebarItem::Collection(index) => {
+                if let Some(collection) = self.state.collections.get(index) {
+                    vec![
+                        Action::DeleteCollection(index),
+                        Action::ShowNotification {
+                            message: format!("Deleted collection '{}'", collection.name),
+                            kind: crate::state::NotificationKind::Info,
+                        },
+                        Action::Render,
+                    ]
+                } else {
+                    vec![
+                        Action::ShowNotification {
+                            message: String::from("Collection no longer exists"),
+                            kind: crate::state::NotificationKind::Error,
+                        },
+                        Action::Render,
+                    ]
+                }
+            }
+            SidebarItem::Request {
+                collection,
+                request,
+            } => {
+                let Some(req_name) = self
+                    .state
+                    .collections
+                    .get(collection)
+                    .and_then(|col| col.requests.get(request))
+                    .map(|req| req.name.clone())
+                else {
+                    return vec![
+                        Action::ShowNotification {
+                            message: String::from("Saved request no longer exists"),
+                            kind: crate::state::NotificationKind::Error,
+                        },
+                        Action::Render,
+                    ];
+                };
+
+                vec![
+                    Action::DeleteCollectionRequest {
+                        collection,
+                        request,
+                    },
+                    Action::ShowNotification {
+                        message: format!("Deleted saved request '{req_name}'"),
+                        kind: crate::state::NotificationKind::Info,
+                    },
+                    Action::Render,
+                ]
+            }
+            SidebarItem::HistoryEntry(_) | SidebarItem::None => vec![
+                Action::ShowNotification {
+                    message: String::from("Select a collection or saved request to delete"),
+                    kind: crate::state::NotificationKind::Error,
+                },
+                Action::Render,
+            ],
+        }
+    }
 }
 
 // ── Phase 6 helper functions ──────────────────────────────────────────────────
+
+fn default_saved_request_name(req: &crate::state::RequestState) -> String {
+    let url = req.url.trim();
+    if url.is_empty() {
+        format!("{} request", req.method.as_str())
+    } else {
+        format!("{} {url}", req.method.as_str())
+    }
+}
 
 /// Creates a [`SavedRequest`] snapshot from the current [`RequestState`].
 ///
 /// When `persist_sensitive` is `false`, sensitive header values are replaced
 /// with `"[REDACTED]"` and auth credentials are cleared.
-fn snapshot_request(
-    req: &crate::state::RequestState,
-    persist_sensitive: bool,
-) -> SavedRequest {
+fn snapshot_request(req: &crate::state::RequestState, persist_sensitive: bool) -> SavedRequest {
     let mut headers: Vec<SerializedKeyValueRow> = req
         .headers
         .iter()
@@ -2244,11 +2586,15 @@ fn snapshot_request(
         },
         body_format: req.body_format.as_str().to_string(),
         body_json: req.body_json.clone(),
-        body_form: req.body_form.iter().map(|r| SerializedKeyValueRow {
-            key: r.key.clone(),
-            value: r.value.clone(),
-            enabled: r.enabled,
-        }).collect(),
+        body_form: req
+            .body_form
+            .iter()
+            .map(|r| SerializedKeyValueRow {
+                key: r.key.clone(),
+                value: r.value.clone(),
+                enabled: r.enabled,
+            })
+            .collect(),
     }
 }
 
@@ -2856,11 +3202,15 @@ mod tests {
         upsert_query_row_with_token, upsert_row_with_limit,
     };
     use crate::action::{Action, BodyContent};
+    use crate::components::{help_modal, layout_manager::LayoutManager};
+    use crate::persistence::{Collection, SavedRequest};
     use crate::state::{
         AuthMode, BodyFormat, KeyValueRow, MAX_KEY_LENGTH, MAX_VALUE_LENGTH, QueryParamToken,
-        RequestFocus, ResponseMetadata, ResponseSearchScope, ResponseTab,
+        RequestFocus, ResponseMetadata, ResponseSearchScope, ResponseTab, SidebarItem,
+        SidebarPromptMode,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::layout::Rect;
 
     #[test]
     fn upsert_respects_row_limit() {
@@ -3023,6 +3373,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scroll_help_is_bounded_by_rendered_modal_capacity_when_height_is_clamped() {
+        let terminal_size = (140, 120);
+        let mut app = App::new(terminal_size);
+
+        app.apply_action(Action::ScrollHelp(i16::MAX));
+
+        let main_area = LayoutManager::compute(Rect::new(0, 0, terminal_size.0, terminal_size.1)).main;
+        let expected_max_scroll =
+            help_modal::max_scroll_for_area(main_area, help_modal::line_count());
+
+        assert_eq!(help_modal::visible_line_capacity(main_area), 36);
+        assert!(expected_max_scroll > 0);
+        assert_eq!(app.state.help_scroll, expected_max_scroll);
+    }
+
+    #[tokio::test]
     async fn slash_in_url_input_inserts_slash() {
         let mut app = App::new((120, 40));
         app.state.request.focus = RequestFocus::Url;
@@ -3081,6 +3447,159 @@ mod tests {
             close_actions,
             vec![Action::CloseResponseSearch, Action::Render]
         );
+    }
+
+    #[tokio::test]
+    async fn sidebar_create_shortcut_opens_prompt() {
+        let mut app = App::new((120, 40));
+        app.state.sidebar_focused = true;
+
+        let actions =
+            app.map_key_event_to_actions(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+
+        assert_eq!(actions, vec![Action::Render]);
+        assert!(matches!(
+            app.state.sidebar_prompt.as_ref().map(|prompt| &prompt.mode),
+            Some(SidebarPromptMode::CreateCollection)
+        ));
+    }
+
+    #[tokio::test]
+    async fn sidebar_left_right_shortcuts_scroll_collections_horizontally() {
+        let mut app = App::new((120, 40));
+        app.state.sidebar_focused = true;
+
+        let right =
+            app.map_key_event_to_actions(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(
+            right,
+            vec![Action::SidebarScrollCollectionsHorizontal(2), Action::Render]
+        );
+
+        let left = app.map_key_event_to_actions(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(
+            left,
+            vec![Action::SidebarScrollCollectionsHorizontal(-2), Action::Render]
+        );
+    }
+
+    #[tokio::test]
+    async fn sidebar_prompt_mode_keeps_left_right_for_prompt_flow() {
+        let mut app = App::new((120, 40));
+        app.state.sidebar_focused = true;
+        app.state.sidebar_prompt = Some(crate::state::SidebarPromptState {
+            mode: SidebarPromptMode::CreateCollection,
+            value: String::from("name"),
+        });
+
+        let left = app.map_key_event_to_actions(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        let right =
+            app.map_key_event_to_actions(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+
+        assert!(left.is_empty());
+        assert!(right.is_empty());
+        assert_eq!(app.state.sidebar_collections_horizontal_offset, 0);
+    }
+
+    #[tokio::test]
+    async fn sidebar_horizontal_scroll_action_saturates_at_zero() {
+        let mut app = App::new((120, 40));
+
+        app.apply_action(Action::SidebarScrollCollectionsHorizontal(5));
+        assert_eq!(app.state.sidebar_collections_horizontal_offset, 5);
+
+        app.apply_action(Action::SidebarScrollCollectionsHorizontal(-20));
+        assert_eq!(app.state.sidebar_collections_horizontal_offset, 0);
+
+        app.state.sidebar_selected_item = SidebarItem::HistoryEntry(0);
+        app.apply_action(Action::SidebarScrollCollectionsHorizontal(3));
+        assert_eq!(app.state.sidebar_history_horizontal_offset, 3);
+
+        app.apply_action(Action::SidebarScrollCollectionsHorizontal(-10));
+        assert_eq!(app.state.sidebar_history_horizontal_offset, 0);
+    }
+
+    #[tokio::test]
+    async fn sidebar_horizontal_scroll_routes_to_selected_section() {
+        let mut app = App::new((120, 40));
+
+        app.state.sidebar_selected_item = SidebarItem::HistoryEntry(2);
+        app.apply_action(Action::SidebarScrollCollectionsHorizontal(4));
+        assert_eq!(app.state.sidebar_history_horizontal_offset, 4);
+        assert_eq!(app.state.sidebar_collections_horizontal_offset, 0);
+
+        app.state.sidebar_selected_item = SidebarItem::Request {
+            collection: 0,
+            request: 0,
+        };
+        app.apply_action(Action::SidebarScrollCollectionsHorizontal(6));
+        assert_eq!(app.state.sidebar_collections_horizontal_offset, 6);
+        assert_eq!(app.state.sidebar_history_horizontal_offset, 4);
+    }
+
+    #[tokio::test]
+    async fn sidebar_horizontal_scroll_defaults_to_collections_when_nothing_selected() {
+        let mut app = App::new((120, 40));
+        app.state.sidebar_selected_item = SidebarItem::None;
+
+        app.apply_action(Action::SidebarScrollCollectionsHorizontal(2));
+
+        assert_eq!(app.state.sidebar_collections_horizontal_offset, 2);
+        assert_eq!(app.state.sidebar_history_horizontal_offset, 0);
+    }
+
+    #[tokio::test]
+    async fn sidebar_save_shortcut_uses_selected_collection() {
+        let mut app = App::new((120, 40));
+        app.state.sidebar_focused = true;
+        app.state.request.method = crate::state::HttpMethod::Post;
+        app.state.request.url = String::from("https://api.example.com/items");
+        app.state.collections.push(Collection {
+            id: String::from("c1"),
+            name: String::from("API"),
+            expanded: true,
+            requests: Vec::new(),
+        });
+        app.state.sidebar_selected_item = SidebarItem::Collection(0);
+
+        let start_actions =
+            app.map_key_event_to_actions(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert_eq!(start_actions, vec![Action::Render]);
+
+        let confirm_actions =
+            app.map_key_event_to_actions(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(confirm_actions.contains(&Action::SaveRequestToCollection {
+            collection_index: 0,
+            name: String::from("POST https://api.example.com/items"),
+        }));
+    }
+
+    #[tokio::test]
+    async fn sidebar_delete_shortcut_removes_selected_saved_request() {
+        let mut app = App::new((120, 40));
+        app.state.sidebar_focused = true;
+        app.state.collections.push(Collection {
+            id: String::from("c1"),
+            name: String::from("API"),
+            expanded: true,
+            requests: vec![SavedRequest {
+                id: String::from("r1"),
+                name: String::from("Get users"),
+                ..SavedRequest::default()
+            }],
+        });
+        app.state.sidebar_selected_item = SidebarItem::Request {
+            collection: 0,
+            request: 0,
+        };
+
+        let actions =
+            app.map_key_event_to_actions(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+
+        assert!(actions.contains(&Action::DeleteCollectionRequest {
+            collection: 0,
+            request: 0,
+        }));
     }
 
     #[tokio::test]
@@ -3495,7 +4014,11 @@ mod tests {
 
         let saved = snapshot_request(&req, false);
 
-        let auth_header = saved.headers.iter().find(|h| h.key == "Authorization").unwrap();
+        let auth_header = saved
+            .headers
+            .iter()
+            .find(|h| h.key == "Authorization")
+            .unwrap();
         let accept_header = saved.headers.iter().find(|h| h.key == "Accept").unwrap();
 
         assert_eq!(auth_header.value, "[REDACTED]");

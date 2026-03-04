@@ -117,6 +117,7 @@ pub enum Action {
     ToggleSidebar,
     SidebarFocusNext,
     SidebarFocusPrev,
+    SidebarScrollCollectionsHorizontal(i16),
     SidebarSelect,
     SidebarClose,
 

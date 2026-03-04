@@ -570,6 +570,40 @@ pub enum SidebarItem {
     HistoryEntry(usize),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SidebarPromptMode {
+    CreateCollection,
+    RenameCollection { index: usize },
+    SaveRequestToCollection { collection_index: usize },
+    RenameCollectionRequest { collection: usize, request: usize },
+}
+
+impl SidebarPromptMode {
+    pub fn title(&self) -> &'static str {
+        match self {
+            Self::CreateCollection => "New collection",
+            Self::RenameCollection { .. } => "Rename collection",
+            Self::SaveRequestToCollection { .. } => "Save request as",
+            Self::RenameCollectionRequest { .. } => "Rename saved request",
+        }
+    }
+
+    pub fn cancel_label(&self) -> &'static str {
+        match self {
+            Self::CreateCollection => "Create collection",
+            Self::RenameCollection { .. } => "Rename collection",
+            Self::SaveRequestToCollection { .. } => "Save request",
+            Self::RenameCollectionRequest { .. } => "Rename request",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidebarPromptState {
+    pub mode: SidebarPromptMode,
+    pub value: String,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub terminal_size: (u16, u16),
@@ -595,6 +629,12 @@ pub struct AppState {
     pub small_mode_show_response: bool,
     /// Which item is highlighted in the sidebar.
     pub sidebar_selected_item: SidebarItem,
+    /// Horizontal scroll offset for the collections tree labels.
+    pub sidebar_collections_horizontal_offset: usize,
+    /// Horizontal scroll offset for history list labels.
+    pub sidebar_history_horizontal_offset: usize,
+    /// Inline prompt for collection management actions.
+    pub sidebar_prompt: Option<SidebarPromptState>,
     /// All currently in-flight requests across all contexts (authoritative source).
     pub in_flight_requests: HashMap<u64, InFlightRequest>,
     /// Active notification message and kind (if any).
@@ -619,6 +659,10 @@ impl PartialEq for AppState {
             && self.sidebar_focused == other.sidebar_focused
             && self.small_mode_show_response == other.small_mode_show_response
             && self.sidebar_selected_item == other.sidebar_selected_item
+            && self.sidebar_collections_horizontal_offset
+                == other.sidebar_collections_horizontal_offset
+            && self.sidebar_history_horizontal_offset == other.sidebar_history_horizontal_offset
+            && self.sidebar_prompt == other.sidebar_prompt
             && self.in_flight_count() == other.in_flight_count()
             && self.notification == other.notification
             && self.notification_ticks_remaining == other.notification_ticks_remaining
@@ -640,6 +684,15 @@ impl fmt::Debug for AppState {
             .field("sidebar_visible", &self.sidebar_visible)
             .field("sidebar_focused", &self.sidebar_focused)
             .field("small_mode_show_response", &self.small_mode_show_response)
+            .field(
+                "sidebar_collections_horizontal_offset",
+                &self.sidebar_collections_horizontal_offset,
+            )
+            .field(
+                "sidebar_history_horizontal_offset",
+                &self.sidebar_history_horizontal_offset,
+            )
+            .field("sidebar_prompt", &self.sidebar_prompt)
             .field("in_flight_count", &self.in_flight_count())
             .field("notification", &self.notification)
             .field(
@@ -667,6 +720,9 @@ impl AppState {
             sidebar_focused: false,
             small_mode_show_response: false,
             sidebar_selected_item: SidebarItem::None,
+            sidebar_collections_horizontal_offset: 0,
+            sidebar_history_horizontal_offset: 0,
+            sidebar_prompt: None,
             in_flight_requests: HashMap::new(),
             notification: None,
             notification_ticks_remaining: 0,

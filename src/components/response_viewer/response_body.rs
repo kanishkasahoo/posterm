@@ -6,8 +6,9 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
-    Wrap};
+use ratatui::widgets::{
+    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+};
 
 use crate::highlight;
 use crate::state::{AppState, ResponseSearchScope};
@@ -37,12 +38,10 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         || !state.response.buffer.is_empty();
 
     if !has_content {
-        let empty = Paragraph::new(
-            "No response yet.\n\nPress Ctrl+S to send the current request.",
-        )
-        .style(Style::default().fg(Color::DarkGray))
-        .block(Block::default().borders(Borders::ALL).title("Body"))
-        .alignment(ratatui::layout::Alignment::Center);
+        let empty = Paragraph::new("No response yet.\n\nPress Ctrl+S to send the current request.")
+            .style(Style::default().fg(Color::DarkGray))
+            .block(Block::default().borders(Borders::ALL).title("Body"))
+            .alignment(ratatui::layout::Alignment::Center);
         frame.render_widget(empty, area);
         return;
     }
@@ -102,8 +101,8 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 
     // Vertical scrollbar — only when content overflows.
     if total_lines > inner_height {
-        let mut sb_state = ScrollbarState::new(total_lines.saturating_sub(inner_height))
-            .position(vertical_scroll);
+        let mut sb_state =
+            ScrollbarState::new(total_lines.saturating_sub(inner_height)).position(vertical_scroll);
         frame.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight),
             area,

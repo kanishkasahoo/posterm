@@ -1,9 +1,9 @@
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::widgets::{Block, Clear};
-use ratatui::Frame;
 
-use crate::components::sidebar::Sidebar;
 use crate::components::Component;
+use crate::components::sidebar::Sidebar;
 use crate::state::AppState;
 
 /// Renders the sidebar as a floating overlay panel on the left ~35% of `area`.

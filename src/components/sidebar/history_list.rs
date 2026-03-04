@@ -13,6 +13,10 @@ use crate::state::{AppState, SidebarItem};
 /// Entries are assumed to already be in most-recent-first order
 /// (as maintained by `AppState.history`).
 pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let visible_items = usize::from(area.height.saturating_sub(2));
+    let has_vertical_scrollbar = state.history.len() > visible_items;
+    let content_width = usize::from(area.width).saturating_sub(usize::from(has_vertical_scrollbar));
+
     let mut items: Vec<ListItem> = Vec::new();
 
     for (idx, entry) in state.history.iter().enumerate() {
@@ -31,8 +35,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 
         let method_style = method_color(&entry.method);
 
-        // Truncate URL for display.
-        let url_display = truncate_url(&entry.url, 22);
+        let url_display = display_url(&entry.url);
 
         let base_style = if is_selected && state.sidebar_focused {
             Style::default().fg(Color::Black).bg(Color::White)
@@ -65,7 +68,11 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
             ])
         };
 
-        items.push(ListItem::new(line));
+        items.push(ListItem::new(clamp_line_horizontal(
+            line,
+            state.sidebar_history_horizontal_offset,
+            content_width,
+        )));
     }
 
     if items.is_empty() {
@@ -90,7 +97,6 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 
     // Vertical scrollbar when history overflows.
     let total_items = state.history.len();
-    let visible_items = usize::from(area.height.saturating_sub(2));
     if total_items > visible_items {
         let scroll_pos = selected_flat.unwrap_or(0);
         let mut sb_state =
@@ -133,25 +139,55 @@ fn format_unix_time(secs: u64) -> String {
     format!("{:02}:{:02}", hours, minutes)
 }
 
-/// Truncates a URL for display, keeping a leading protocol and path fragment.
-fn truncate_url(url: &str, max_chars: usize) -> String {
-    // Strip scheme for brevity.
-    let display = url
-        .strip_prefix("https://")
+/// Strips URL scheme for compact display in the history sidebar.
+fn display_url(url: &str) -> String {
+    url.strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))
-        .unwrap_or(url);
+        .unwrap_or(url)
+        .to_string()
+}
 
-    if display.chars().count() <= max_chars {
-        display.to_string()
-    } else {
-        let truncated: String = display.chars().take(max_chars.saturating_sub(1)).collect();
-        format!("{truncated}…")
+fn clamp_line_horizontal(line: Line<'static>, offset: usize, max_chars: usize) -> Line<'static> {
+    if max_chars == 0 {
+        return Line::default();
     }
+
+    let mut remaining_offset = offset;
+    let mut remaining_chars = max_chars;
+    let mut spans: Vec<Span<'static>> = Vec::new();
+
+    for span in line.spans {
+        if remaining_chars == 0 {
+            break;
+        }
+
+        let text = span.content.into_owned();
+        let text_len = text.chars().count();
+
+        if remaining_offset >= text_len {
+            remaining_offset -= text_len;
+            continue;
+        }
+
+        let start = remaining_offset;
+        remaining_offset = 0;
+        let take = (text_len - start).min(remaining_chars);
+        if take == 0 {
+            continue;
+        }
+
+        let clipped: String = text.chars().skip(start).take(take).collect();
+        remaining_chars -= take;
+        spans.push(Span::styled(clipped, span.style));
+    }
+
+    Line::from(spans)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::style::Style;
 
     #[test]
     fn format_unix_time_returns_hh_mm() {
@@ -166,36 +202,43 @@ mod tests {
     }
 
     #[test]
-    fn truncate_url_strips_https_scheme() {
-        assert_eq!(
-            truncate_url("https://example.com/path", 50),
-            "example.com/path"
-        );
+    fn display_url_strips_https_scheme() {
+        assert_eq!(display_url("https://example.com/path"), "example.com/path");
     }
 
     #[test]
-    fn truncate_url_strips_http_scheme() {
-        assert_eq!(truncate_url("http://example.com", 50), "example.com");
+    fn display_url_strips_http_scheme() {
+        assert_eq!(display_url("http://example.com"), "example.com");
     }
 
     #[test]
-    fn truncate_url_truncates_long_urls_with_ellipsis() {
-        let url = "https://example.com/very/long/path/that/exceeds/limit";
-        let result = truncate_url(url, 10);
-        // Result should be ≤ 10 chars (9 chars + ellipsis)
-        assert!(result.chars().count() <= 10);
-        assert!(result.ends_with('…'));
+    fn display_url_handles_no_scheme() {
+        assert_eq!(display_url("example.com/api"), "example.com/api");
     }
 
     #[test]
-    fn truncate_url_leaves_short_urls_intact() {
-        let url = "https://a.io";
-        assert_eq!(truncate_url(url, 10), "a.io");
+    fn clamp_line_horizontal_respects_offset_across_spans() {
+        let line = Line::from(vec![
+            Span::styled("12:34 ", Style::default()),
+            Span::styled("GET ", Style::default()),
+            Span::styled("example.com/very/long/path ", Style::default()),
+            Span::styled("200", Style::default()),
+        ]);
+
+        let clipped = clamp_line_horizontal(line, 10, 14);
+        let rendered: String = clipped
+            .spans
+            .into_iter()
+            .map(|s| s.content.into_owned())
+            .collect();
+        assert_eq!(rendered, "example.com/ve");
     }
 
     #[test]
-    fn truncate_url_handles_no_scheme() {
-        assert_eq!(truncate_url("example.com/api", 50), "example.com/api");
+    fn clamp_line_horizontal_returns_empty_when_offset_is_past_end() {
+        let line = Line::from(Span::raw("history"));
+        let clipped = clamp_line_horizontal(line, 20, 8);
+        assert!(clipped.spans.is_empty());
     }
 
     #[test]

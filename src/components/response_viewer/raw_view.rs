@@ -1,9 +1,9 @@
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Text};
 use ratatui::widgets::{
     Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
 };
-use ratatui::Frame;
 
 use crate::state::{AppState, ResponseSearchScope};
 

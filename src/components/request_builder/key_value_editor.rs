@@ -1,9 +1,9 @@
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::widgets::{
     Block, Borders, Cell, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table, TableState,
 };
-use ratatui::Frame;
 
 use crate::state::{KeyValueEditorState, KeyValueField, KeyValueRow, RequestFocus};
 
