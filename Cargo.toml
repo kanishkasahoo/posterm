@@ -2,6 +2,9 @@
 name = "posterm"
 version = "0.1.0"
 edition = "2024"
+description = "A terminal application for Postman-style workflows"
+authors = ["Posterm Contributors"]
+license = "MIT"
 
 [dependencies]
 base64 = "0.22"
