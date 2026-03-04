@@ -1,156 +1,93 @@
 # posterm
 
-Terminal-based HTTP client built with Rust + Ratatui.
+posterm is a TUI-based API client for testing HTTP APIs, built with Rust and Ratatui.
 
-## Install from Releases
+## Install
 
-CI publishes installable artifacts on GitHub Releases for supported platforms:
-
-- Linux: `.tar.gz`
-- macOS: `.tar.gz` and `.pkg`
-- Windows: `.zip` and `.msi`
-
-Download the artifact for your OS from the repo's **Releases** page, then install/run:
-
-- Linux/macOS `.tar.gz`: extract and run the `posterm` binary
-- macOS `.pkg`: open the package and follow the installer
-- Windows `.zip`: extract and run `posterm.exe`
-- Windows `.msi`: run the installer and launch from Start Menu/terminal
-
-## Build from source
-
-Prerequisites:
-
-- Rust toolchain (stable) with `cargo` installed
-- A terminal that supports TUI applications
-
-Install Rust (if needed):
+### Script (macOS and Ubuntu — recommended)
 
 ```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+curl -fsSL https://raw.githubusercontent.com/kanishkasahoo/posterm/main/scripts/install.sh | bash
 ```
 
-From the project root, build the app:
+To install a specific version:
 
 ```bash
-cargo build
+curl -fsSL https://raw.githubusercontent.com/kanishkasahoo/posterm/main/scripts/install.sh | bash -s -- v1.2.3
 ```
 
-Run in development mode:
+Or clone the repo and run directly:
 
 ```bash
-cargo run
+bash scripts/install.sh
+bash scripts/install.sh v1.2.3   # pin to a version
 ```
 
-Run optimized mode:
+The script detects your OS and architecture, downloads the matching release tarball from GitHub Releases, verifies the SHA-256 checksum, and installs the binary to `/usr/local/bin/posterm` (using `sudo` if needed).
+
+### From Releases
+
+Pre-built artifacts are published on the [Releases](../../releases) page for each version:
+
+| Platform | Formats |
+|----------|---------|
+| Linux (Ubuntu) | `.tar.gz` |
+| macOS | `.tar.gz`, `.pkg` |
+| Windows | `.zip`, `.msi` |
+
+Download the artifact for your platform, extract or run the installer, and place the binary on your `PATH`.
+
+### Build from Source
+
+Requires a stable Rust toolchain with `cargo`.
 
 ```bash
-cargo run --release
+cargo build --release
 ```
 
-## Configuration and History
+The binary is written to `target/release/posterm`.
 
-posterm stores local state in a single app config directory (`posterm/`) resolved from `dirs::config_dir()`, with a fallback to `$HOME/.config/posterm`.
+## Self-Update
 
-Typical resolved paths:
+Press `Ctrl+U` inside posterm to check for and apply the latest release. Updates are verified against an Ed25519 signature embedded in the binary before being applied.
 
-- Linux: `$XDG_CONFIG_HOME/posterm` (or `~/.config/posterm`)
-- macOS: `~/Library/Application Support/posterm`
-- Windows: `%APPDATA%\\posterm`
-- Fallback (if platform config dir lookup fails): `$HOME/.config/posterm`
+## Configuration
 
-### What gets created, and when
+posterm stores configuration in a `posterm/` directory under the platform config dir:
 
-At startup (`App::new`):
+| Platform | Path |
+|----------|------|
+| Linux | `$XDG_CONFIG_HOME/posterm` (or `~/.config/posterm`) |
+| macOS | `~/Library/Application Support/posterm` |
+| Windows | `%APPDATA%\posterm` |
 
-- `posterm/collections/` is created immediately
-- `posterm/config.toml` is created immediately if missing, using defaults
-- `posterm/history.toml` is **not** created on startup
+`config.toml` is created with defaults on first run. Available options:
 
-`history.toml` is written when history is persisted (after request completion, explicit history record, or clear-history action), via debounced saves.
+| Key | Default | Description |
+|-----|---------|-------------|
+| `default_timeout_secs` | `30` | Request timeout in seconds |
+| `history_limit` | `200` | Maximum number of history entries to keep |
+| `follow_redirects` | `true` | Follow HTTP redirects |
+| `persist_sensitive_headers` | `false` | Whether to save sensitive headers to disk |
 
-### `config.toml`
+## Security
 
-`config.toml` is deserialized into `AppConfig`. If the file is missing or invalid TOML, defaults are used.
+**Header redaction.** When `persist_sensitive_headers = false` (the default), sensitive header values (`Authorization`, `Cookie`, `Set-Cookie`, `Proxy-Authorization`) and auth credentials are replaced with `[REDACTED]` in saved history and collection snapshots. Set to `true` to store them as entered.
 
-```toml
-default_timeout_secs = 30
-history_limit = 200
-follow_redirects = true
-persist_sensitive_headers = false
-```
+**Atomic writes.** Config and history files are written via a temp file and atomic rename. On Unix, temp files are created with `0600` permissions before rename.
 
-Current behavior tied to these fields in code:
+**Environment variables.**
 
-- `history_limit`: caps in-memory history and persisted history (`take(limit)` from newest first)
-- `persist_sensitive_headers`: controls redaction for saved history snapshots and collection snapshots
-- `default_timeout_secs` and `follow_redirects`: currently persisted but not applied to request execution path yet
+| Variable | Effect |
+|----------|--------|
+| `POSTERM_ALLOW_INSECURE_TLS=1` | Enables intentionally insecure TLS mode in request execution |
+| `POSTERM_UPDATE_SIGNING_KEY` | Repository secret: base64-encoded Ed25519 seed used to sign release binaries (CI only) |
 
-### `history.toml`
+## Release Signing (CI)
 
-History is stored as TOML `[[entries]]`, newest entry first.
+The `POSTERM_UPDATE_SIGNING_KEY` repository secret must be set before running the release workflow. It is a base64-encoded raw 32-byte Ed25519 seed.
 
-Each entry contains:
+For exact key generation and public-key extraction commands, see the comment block at the top of `.github/workflows/build-and-package.yml`. In summary:
 
-- `id` (UUID string)
-- `timestamp_secs` (Unix seconds)
-- `method`, `url`
-- optional `status_code`, `elapsed_ms`
-- optional `request` snapshot (`SavedRequest`), including method/url/query/header/auth/body fields
-
-Representative snippet (field names/shape from serde structs):
-
-```toml
-[[entries]]
-id = "5d6fd02e-7fc2-4c34-9ed5-bceec8df89a2"
-timestamp_secs = 1700000000
-method = "GET"
-url = "https://example.com/users"
-status_code = 200
-elapsed_ms = 42
-
-[entries.request]
-id = "f95a84cf-8d35-4525-96c0-af2f4cc24313"
-name = ""
-method = "GET"
-url = "https://example.com/users"
-auth_mode = "None"
-auth_token = ""
-auth_username = ""
-auth_password = ""
-body_format = "JSON"
-body_json = ""
-```
-
-Persistence/retention details:
-
-- Debounced writes: saves are scheduled and flushed after ~500ms of inactivity on that target
-- Flushes happen on tick events (app tick is 250ms)
-- Limit enforcement happens both when entries are added and again when writing to disk
-- No history file rotation/archive is implemented (single `history.toml` is rewritten)
-- On read error or TOML parse error, history loads as empty
-
-### Security and privacy notes
-
-- Sensitive headers are identified case-insensitively by name: `Authorization`, `Cookie`, `Set-Cookie`, `Proxy-Authorization`
-- If `persist_sensitive_headers = false` (default), persisted snapshots replace sensitive header values with `"[REDACTED]"` and clear `auth_token`, `auth_username`, and `auth_password`
-- If `persist_sensitive_headers = true`, those values are stored as entered
-- Persistence uses atomic write (`*.tmp` then rename); on Unix, temp files are set to `0600` before rename
-
-Optional environment variable:
-
-- `POSTERM_ALLOW_INSECURE_TLS=1` allows selecting intentionally insecure TLS mode in request execution
-
-## Useful scripts
-
-- Run tests:
-
-  ```bash
-  cargo test
-  ```
-
-- Build release binary:
-
-  ```bash
-  cargo build --release
-  ```
+1. Generate a random 32-byte seed and base64-encode it — store this as the `POSTERM_UPDATE_SIGNING_KEY` repository secret.
+2. Derive the corresponding Ed25519 public key bytes and embed them in `src/updater.rs` as `POSTERM_UPDATE_PUBKEY`.

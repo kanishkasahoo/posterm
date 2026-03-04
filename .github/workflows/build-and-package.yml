@@ -1,5 +1,26 @@
 name: Build and Package
 
+# ─── Signing key setup ────────────────────────────────────────────────────────
+# POSTERM_UPDATE_SIGNING_KEY must be set as a repository secret.
+# It is a base64-encoded raw 32-byte Ed25519 seed.
+#
+# To generate a new key:
+#   python3 -c "import os, base64; print(base64.b64encode(os.urandom(32)).decode())"
+#
+# The corresponding public key should be embedded in src/updater.rs as
+# POSTERM_UPDATE_PUBKEY.  To extract it after generating the secret:
+#   python3 -c "
+#     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+#     import base64
+#     seed = base64.b64decode('<YOUR_SECRET>')
+#     key  = Ed25519PrivateKey.from_private_bytes(seed)
+#     pub  = key.public_key().public_bytes_raw()
+#     print(list(pub))
+#   "
+# Paste the resulting list into src/updater.rs as:
+#   const POSTERM_UPDATE_PUBKEY: [u8; 32] = [ ... ];
+# ──────────────────────────────────────────────────────────────────────────────
+
 on:
   workflow_dispatch:
     inputs:
@@ -44,11 +65,52 @@ jobs:
           mkdir -p dist
           tar -czf "dist/${BINARY_NAME}-linux.tar.gz" -C target/release "${BINARY_NAME}"
 
+      - name: Generate Linux tarball SHA-256 checksum
+        run: |
+          sha256sum "dist/${BINARY_NAME}-linux.tar.gz" \
+            | awk '{print $1}' \
+            > "dist/${BINARY_NAME}-linux.tar.gz.sha256"
+
+      - name: Sign Linux binary (Ed25519)
+        env:
+          POSTERM_UPDATE_SIGNING_KEY: ${{ secrets.POSTERM_UPDATE_SIGNING_KEY }}
+        run: |
+          python3 - <<'PYEOF'
+          import os, sys, base64
+
+          secret = os.environ.get("POSTERM_UPDATE_SIGNING_KEY", "").strip()
+          if not secret:
+              print("WARNING: POSTERM_UPDATE_SIGNING_KEY secret is absent or empty — skipping Ed25519 signing.", flush=True)
+              sys.exit(0)
+
+          binary_name = os.environ["BINARY_NAME"]
+          binary_path = f"target/release/{binary_name}"
+          sig_path    = f"dist/{binary_name}-linux.tar.gz.sig"
+
+          from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+          seed    = base64.b64decode(secret)
+          privkey = Ed25519PrivateKey.from_private_bytes(seed)
+
+          with open(binary_path, "rb") as fh:
+              payload = fh.read()
+
+          signature = privkey.sign(payload)   # raw 64-byte Ed25519 signature
+
+          with open(sig_path, "wb") as fh:
+              fh.write(signature)
+
+          print(f"Ed25519 signature written to {sig_path} ({len(signature)} bytes)", flush=True)
+          PYEOF
+
       - name: Upload Linux artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.BINARY_NAME }}-ubuntu
-          path: dist/${{ env.BINARY_NAME }}-linux.tar.gz
+          path: |
+            dist/${{ env.BINARY_NAME }}-linux.tar.gz
+            dist/${{ env.BINARY_NAME }}-linux.tar.gz.sha256
+            dist/${{ env.BINARY_NAME }}-linux.tar.gz.sig
           if-no-files-found: error
 
   build-macos:
@@ -101,6 +163,44 @@ jobs:
             --install-location "/" \
             "dist/${BINARY_NAME}-macos.pkg"
 
+      - name: Generate macOS tarball SHA-256 checksum
+        run: |
+          shasum -a 256 "dist/${BINARY_NAME}-macos.tar.gz" \
+            | awk '{print $1}' \
+            > "dist/${BINARY_NAME}-macos.tar.gz.sha256"
+
+      - name: Sign macOS binary (Ed25519)
+        env:
+          POSTERM_UPDATE_SIGNING_KEY: ${{ secrets.POSTERM_UPDATE_SIGNING_KEY }}
+        run: |
+          python3 - <<'PYEOF'
+          import os, sys, base64
+
+          secret = os.environ.get("POSTERM_UPDATE_SIGNING_KEY", "").strip()
+          if not secret:
+              print("WARNING: POSTERM_UPDATE_SIGNING_KEY secret is absent or empty — skipping Ed25519 signing.", flush=True)
+              sys.exit(0)
+
+          binary_name = os.environ["BINARY_NAME"]
+          binary_path = f"target/release/{binary_name}"
+          sig_path    = f"dist/{binary_name}-macos.tar.gz.sig"
+
+          from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+          seed    = base64.b64decode(secret)
+          privkey = Ed25519PrivateKey.from_private_bytes(seed)
+
+          with open(binary_path, "rb") as fh:
+              payload = fh.read()
+
+          signature = privkey.sign(payload)   # raw 64-byte Ed25519 signature
+
+          with open(sig_path, "wb") as fh:
+              fh.write(signature)
+
+          print(f"Ed25519 signature written to {sig_path} ({len(signature)} bytes)", flush=True)
+          PYEOF
+
       - name: Upload macOS artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -108,6 +208,8 @@ jobs:
           path: |
             dist/${{ env.BINARY_NAME }}-macos.tar.gz
             dist/${{ env.BINARY_NAME }}-macos.pkg
+            dist/${{ env.BINARY_NAME }}-macos.tar.gz.sha256
+            dist/${{ env.BINARY_NAME }}-macos.tar.gz.sig
           if-no-files-found: error
 
   build-windows:
@@ -220,7 +322,11 @@ jobs:
           fail_on_unmatched_files: true
           files: |
             release-assets/ubuntu/${{ env.BINARY_NAME }}-linux.tar.gz
+            release-assets/ubuntu/${{ env.BINARY_NAME }}-linux.tar.gz.sha256
+            release-assets/ubuntu/${{ env.BINARY_NAME }}-linux.tar.gz.sig
             release-assets/macos/${{ env.BINARY_NAME }}-macos.tar.gz
+            release-assets/macos/${{ env.BINARY_NAME }}-macos.tar.gz.sha256
+            release-assets/macos/${{ env.BINARY_NAME }}-macos.tar.gz.sig
             release-assets/macos/${{ env.BINARY_NAME }}-macos.pkg
             release-assets/windows/${{ env.BINARY_NAME }}-windows.zip
             release-assets/windows/${{ env.BINARY_NAME }}-windows.msi

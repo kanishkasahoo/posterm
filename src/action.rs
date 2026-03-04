@@ -1,5 +1,6 @@
 use crate::persistence::HistoryEntry;
 use crate::state::{AuthMode, BodyFormat, HttpMethod, KeyValueRow, ResponseMetadata, ResponseTab};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BodyContent {
@@ -79,6 +80,26 @@ pub enum Action {
     CloseHelp,
     ScrollHelp(i16),
     ToggleSmallModePane,
+
+    // ── Updater ───────────────────────────────────────────────────────────────
+    CheckForUpdate,
+    UpdateChecking,
+    UpdateDownloading {
+        version: String,
+    },
+    UpdateUpToDate {
+        version: String,
+    },
+    UpdateStaged {
+        version: String,
+        staged_path: PathBuf,
+    },
+    UpdateUnsupported {
+        message: String,
+    },
+    UpdateFailed {
+        message: String,
+    },
 
     // ── Collections ──────────────────────────────────────────────────────────
     CreateCollection {

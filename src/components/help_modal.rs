@@ -1,10 +1,10 @@
+use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{
     Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
-use ratatui::Frame;
 
 use crate::state::AppState;
 
@@ -100,6 +100,7 @@ fn shortcut_lines() -> Vec<Line<'static>> {
         Line::from("Global"),
         Line::from("  F1             Toggle help"),
         Line::from("  Ctrl+Q         Quit"),
+        Line::from("  Ctrl+U         Check for app updates"),
         Line::from("  Ctrl+S         Send request"),
         Line::from("  Ctrl+C         Cancel request"),
         Line::from("  Tab/Shift+Tab  Move request focus"),

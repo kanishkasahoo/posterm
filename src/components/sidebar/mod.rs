@@ -1,12 +1,12 @@
 pub mod collection_tree;
 pub mod history_list;
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::{Block, BorderType, Borders};
-use ratatui::Frame;
 
 use crate::action::Action;
 use crate::components::Component;
