@@ -49,7 +49,13 @@ The binary is written to `target/release/posterm`.
 
 ## Self-Update
 
-Press `Ctrl+U` inside posterm to check for and apply the latest release. Updates are verified against an Ed25519 signature embedded in the binary before being applied.
+Run `posterm upgrade` from your terminal to check for and apply the latest release:
+
+```bash
+posterm upgrade
+```
+
+The upgrade command checks the latest GitHub release, downloads the matching artifact, verifies the SHA-256 checksum and Ed25519 signature, and replaces the running binary in-place. If the installation path requires elevated permissions, the staged binary path is printed for manual copy.
 
 ## Configuration
 
@@ -81,7 +87,6 @@ posterm stores configuration in a `posterm/` directory under the platform config
 | Variable | Effect |
 |----------|--------|
 | `POSTERM_ALLOW_INSECURE_TLS=1` | Enables intentionally insecure TLS mode in request execution |
-| `POSTERM_UPDATE_SIGNING_KEY` | Repository secret: base64-encoded Ed25519 seed used to sign release binaries (CI only) |
 
 ## Release Signing (CI)
 
