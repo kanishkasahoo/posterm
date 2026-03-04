@@ -81,10 +81,6 @@ impl Component for StatusBar {
 
         spans.push(Span::raw(String::from(" | ")));
 
-        spans.push(Span::raw(format!("Update: {}", state.updater.status_text)));
-
-        spans.push(Span::raw(String::from(" | ")));
-
         if state.help_visible {
             spans.push(Span::raw(String::from("Close help: Esc")));
             spans.push(Span::raw(String::from(" | ")));

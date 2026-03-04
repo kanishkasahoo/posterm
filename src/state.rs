@@ -13,36 +13,6 @@ pub enum NotificationKind {
     Error,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum UpdaterPhase {
-    Idle,
-    Checking,
-    Downloading,
-    UpToDate,
-    PendingRestart,
-    Unsupported,
-    Failed,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UpdaterState {
-    pub phase: UpdaterPhase,
-    pub status_text: String,
-    pub pending_version: Option<String>,
-    pub in_progress: bool,
-}
-
-impl Default for UpdaterState {
-    fn default() -> Self {
-        Self {
-            phase: UpdaterPhase::Idle,
-            status_text: String::from("idle"),
-            pending_version: None,
-            in_progress: false,
-        }
-    }
-}
-
 pub const MAX_URL_LENGTH: usize = 2_048;
 pub const MAX_KEY_LENGTH: usize = 256;
 pub const MAX_VALUE_LENGTH: usize = 4_096;
@@ -671,8 +641,6 @@ pub struct AppState {
     pub notification: Option<(String, NotificationKind)>,
     /// Remaining ticks before the notification auto-dismisses.
     pub notification_ticks_remaining: u8,
-    /// Self-update lifecycle state.
-    pub updater: UpdaterState,
 }
 
 impl PartialEq for AppState {
@@ -698,7 +666,6 @@ impl PartialEq for AppState {
             && self.in_flight_count() == other.in_flight_count()
             && self.notification == other.notification
             && self.notification_ticks_remaining == other.notification_ticks_remaining
-            && self.updater == other.updater
     }
 }
 
@@ -732,7 +699,6 @@ impl fmt::Debug for AppState {
                 "notification_ticks_remaining",
                 &self.notification_ticks_remaining,
             )
-            .field("updater", &self.updater)
             .finish()
     }
 }
@@ -760,7 +726,6 @@ impl AppState {
             in_flight_requests: HashMap::new(),
             notification: None,
             notification_ticks_remaining: 0,
-            updater: UpdaterState::default(),
         }
     }
 

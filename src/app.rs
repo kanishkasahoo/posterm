@@ -33,10 +33,9 @@ use crate::state::{
     MAX_AUTH_TOKEN_LENGTH, MAX_AUTH_USERNAME_LENGTH, MAX_BODY_FORM_ROWS, MAX_BODY_TEXT_LENGTH,
     MAX_HEADER_ROWS, MAX_KEY_LENGTH, MAX_QUERY_PARAM_ROWS, MAX_URL_LENGTH, MAX_VALUE_LENGTH,
     QueryParamToken, RequestTab, ResponseSearchScope, ResponseTab, SearchMatch, SidebarItem,
-    SidebarPromptMode, SidebarPromptState, SyncDirection, UpdaterPhase,
+    SidebarPromptMode, SidebarPromptState, SyncDirection,
 };
 use crate::tui::Tui;
-use crate::updater;
 use crate::util::terminal_sanitize::sanitize_terminal_text;
 use crate::util::url_parser::{parse_query_params, rebuild_url_with_params};
 
@@ -59,7 +58,6 @@ pub struct App {
     active_response_id: Option<u64>,
     pending_response_search_bytes: usize,
     persistence: PersistenceManager,
-    updater_task: Option<JoinHandle<()>>,
 }
 
 const MAX_RESPONSE_SEARCH_QUERY_CHARS: usize = 256;
@@ -93,7 +91,6 @@ impl App {
             active_response_id: None,
             pending_response_search_bytes: 0,
             persistence: PersistenceManager::new(),
-            updater_task: None,
         }
     }
 
@@ -291,9 +288,6 @@ impl App {
             }
             (KeyCode::Char('c'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
                 return vec![Action::CancelRequest, Action::Render];
-            }
-            (KeyCode::Char('u'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
-                return vec![Action::CheckForUpdate, Action::Render];
             }
             (KeyCode::Tab, _) => {
                 let mut acts = vec![Action::FocusNext, Action::Render];
@@ -1470,223 +1464,6 @@ impl App {
         self.request_cancel_senders.remove(&request_id);
     }
 
-    fn start_update_check_task(&mut self) {
-        if self.state.updater.in_progress {
-            self.state.notification = Some((
-                String::from("Update check already running"),
-                crate::state::NotificationKind::Info,
-            ));
-            self.state.notification_ticks_remaining = 30;
-            return;
-        }
-
-        self.state.updater.in_progress = true;
-        self.state.updater.phase = UpdaterPhase::Checking;
-        self.state.updater.status_text = String::from("checking");
-
-        let sender = self.action_sender.clone();
-        self.updater_task = Some(tokio::spawn(async move {
-            let _ = sender.send(Action::UpdateChecking).await;
-
-            let current_version = env!("CARGO_PKG_VERSION");
-            let asset_name = match updater::release_asset_for_current_platform() {
-                Ok(asset_name) => asset_name,
-                Err(updater::UpdateError::UnsupportedPlatform(reason)) => {
-                    let _ = sender
-                        .send(Action::UpdateUnsupported { message: reason })
-                        .await;
-                    return;
-                }
-                Err(error) => {
-                    let _ = sender
-                        .send(Action::UpdateFailed {
-                            message: error.to_string(),
-                        })
-                        .await;
-                    return;
-                }
-            };
-
-            // HIGH-3: Apply connection and overall timeouts to the updater client
-            // so a slow or stalled CDN cannot hang the application indefinitely.
-            // MEDIUM-NW-2: Enforce HTTPS-only and cap redirects to 3 to prevent
-            // redirect-based protocol downgrade or redirect-loop attacks.
-            let client = match reqwest::Client::builder()
-                .user_agent(format!("posterm/{current_version}"))
-                .timeout(Duration::from_secs(120))
-                .connect_timeout(Duration::from_secs(10))
-                .https_only(true)
-                .redirect(reqwest::redirect::Policy::limited(3))
-                .build()
-            {
-                Ok(client) => client,
-                Err(error) => {
-                    let _ = sender
-                        .send(Action::UpdateFailed {
-                            message: format!("Failed to build update client: {error}"),
-                        })
-                        .await;
-                    return;
-                }
-            };
-
-            let latest = match updater::check_latest_version_via_github_api(&client).await {
-                Ok(latest) => latest,
-                Err(error) => {
-                    let _ = sender
-                        .send(Action::UpdateFailed {
-                            message: error.to_string(),
-                        })
-                        .await;
-                    return;
-                }
-            };
-
-            // MEDIUM-2: Use semver comparison instead of string equality to
-            // protect against downgrade attacks and pre-release confusion.
-            match updater::check_version_is_upgrade(current_version, &latest.tag_name) {
-                Ok(()) => {}
-                Err(updater::UpdateError::VersionParse(ref msg))
-                    if msg.starts_with("ALREADY_UP_TO_DATE:") =>
-                {
-                    let _ = sender
-                        .send(Action::UpdateUpToDate {
-                            version: latest.tag_name,
-                        })
-                        .await;
-                    return;
-                }
-                Err(error) => {
-                    // Semver parse failure: fall back to string equality to
-                    // keep the updater functional for non-semver tags.
-                    if latest.tag_name.trim_start_matches('v')
-                        == current_version.trim_start_matches('v')
-                    {
-                        let _ = sender
-                            .send(Action::UpdateUpToDate {
-                                version: latest.tag_name,
-                            })
-                            .await;
-                        return;
-                    }
-                    // Log the parse error but proceed; the binary is
-                    // authenticated by SHA-256 + Ed25519 regardless.
-                    eprintln!("[posterm] updater: semver comparison failed ({error}); proceeding");
-                }
-            }
-
-            let _ = sender
-                .send(Action::UpdateDownloading {
-                    version: latest.tag_name.clone(),
-                })
-                .await;
-
-            match updater::download_release_asset_and_checksum(
-                &client,
-                &latest.tag_name,
-                asset_name,
-            )
-            .await
-            .and_then(|(archive_bytes, checksum_text)| {
-                // Step 1: Verify SHA-256 integrity of the archive.
-                updater::verify_sha256(&archive_bytes, &checksum_text)?;
-
-                // Step 2: Extract the binary from the verified archive.
-                let binary_bytes =
-                    updater::extract_expected_binary_from_tar(&archive_bytes, "posterm")?;
-
-                Ok((binary_bytes, latest.tag_name.clone()))
-            }) {
-                Err(error) => {
-                    let _ = sender
-                        .send(Action::UpdateFailed {
-                            message: error.to_string(),
-                        })
-                        .await;
-                }
-                Ok((binary_bytes, version_tag)) => {
-                    // Step 3 (HIGH-1): Download the Ed25519 signature for the
-                    // extracted binary and verify it against the embedded public key.
-                    // The `.sig` file is uploaded alongside the archive in each
-                    // GitHub release, and is exactly 64 bytes (raw Ed25519 signature).
-                    let sig_asset_name = format!("{asset_name}.sig");
-                    let sig_result: Result<Vec<u8>, updater::UpdateError> = async {
-                        let sig_url = format!(
-                            "https://github.com/kanishkasahoo/posterm/releases/download/{}/{sig_asset_name}",
-                            version_tag
-                        );
-                        let sig_response = client
-                            .get(&sig_url)
-                            .send()
-                            .await
-                            .map_err(|error| updater::UpdateError::Http(format!(
-                                "Failed to download signature file: {error}"
-                            )))?;
-                        if !sig_response.status().is_success() {
-                            return Err(updater::UpdateError::Http(format!(
-                                "Signature download failed with status {}",
-                                sig_response.status()
-                            )));
-                        }
-                        // HIGH-1: Apply MAX_SIG_BYTES cap before buffering.
-                        if let Some(content_length) = sig_response.content_length() {
-                            if content_length > updater::MAX_SIG_BYTES {
-                                return Err(updater::UpdateError::Http(format!(
-                                    "Signature Content-Length ({content_length} bytes) exceeds \
-                                     the {}-byte limit",
-                                    updater::MAX_SIG_BYTES
-                                )));
-                            }
-                        }
-                        let sig_raw = sig_response
-                            .bytes()
-                            .await
-                            .map_err(|error| updater::UpdateError::Http(format!(
-                                "Failed to read signature bytes: {error}"
-                            )))?;
-                        if sig_raw.len() as u64 > updater::MAX_SIG_BYTES {
-                            return Err(updater::UpdateError::Http(format!(
-                                "Signature file ({} bytes) exceeds the {}-byte limit",
-                                sig_raw.len(),
-                                updater::MAX_SIG_BYTES
-                            )));
-                        }
-                        Ok(sig_raw.to_vec())
-                    }
-                    .await;
-
-                    let outcome = sig_result.and_then(|signature_bytes| {
-                        // Step 3b: Verify the signature against the embedded public key.
-                        updater::verify_ed25519_signature(&binary_bytes, &signature_bytes)?;
-
-                        // Step 4: Stage the authenticated binary.
-                        let staged_path =
-                            updater::stage_file_and_metadata(&binary_bytes, &version_tag)?;
-                        Ok((version_tag, staged_path))
-                    });
-
-                    match outcome {
-                        Ok((version, staged_path)) => {
-                            let _ = sender
-                                .send(Action::UpdateStaged {
-                                    version,
-                                    staged_path,
-                                })
-                                .await;
-                        }
-                        Err(error) => {
-                            let _ = sender
-                                .send(Action::UpdateFailed {
-                                    message: error.to_string(),
-                                })
-                                .await;
-                        }
-                    }
-                }
-            }
-        }));
-    }
-
     fn apply_action(&mut self, action: Action) {
         match action {
             Action::Tick => {
@@ -1992,81 +1769,6 @@ impl App {
                     in_flight.cancellation_requested = true;
                 }
                 self.cancel_active_in_flight_request();
-            }
-            Action::CheckForUpdate => {
-                self.start_update_check_task();
-            }
-            Action::UpdateChecking => {
-                self.state.updater.in_progress = true;
-                self.state.updater.phase = UpdaterPhase::Checking;
-                self.state.updater.status_text = String::from("checking");
-                self.state.notification = Some((
-                    String::from("Checking latest release"),
-                    crate::state::NotificationKind::Info,
-                ));
-                self.state.notification_ticks_remaining = 30;
-            }
-            Action::UpdateDownloading { version } => {
-                self.state.updater.in_progress = true;
-                self.state.updater.phase = UpdaterPhase::Downloading;
-                self.state.updater.status_text = format!("downloading {version}");
-                self.state.notification = Some((
-                    format!("Downloading update {version}"),
-                    crate::state::NotificationKind::Info,
-                ));
-                self.state.notification_ticks_remaining = 40;
-            }
-            Action::UpdateUpToDate { version } => {
-                self.state.updater.in_progress = false;
-                self.state.updater.phase = UpdaterPhase::UpToDate;
-                self.state.updater.status_text = format!("up to date ({version})");
-                self.state.updater.pending_version = None;
-                self.state.notification = Some((
-                    String::from("Already on latest version"),
-                    crate::state::NotificationKind::Info,
-                ));
-                self.state.notification_ticks_remaining = 40;
-                self.updater_task = None;
-            }
-            Action::UpdateStaged {
-                version,
-                staged_path,
-            } => {
-                self.state.updater.in_progress = false;
-                self.state.updater.phase = UpdaterPhase::PendingRestart;
-                self.state.updater.pending_version = Some(version.clone());
-                self.state.updater.status_text = format!("pending restart ({version})");
-                self.state.notification = Some((
-                    format!(
-                        "Update {version} staged at {}. Restart to apply.",
-                        staged_path.display()
-                    ),
-                    crate::state::NotificationKind::Info,
-                ));
-                self.state.notification_ticks_remaining = 50;
-                self.updater_task = None;
-            }
-            Action::UpdateUnsupported { message } => {
-                self.state.updater.in_progress = false;
-                self.state.updater.phase = UpdaterPhase::Unsupported;
-                self.state.updater.status_text = String::from("unsupported platform");
-                self.state.notification = Some((
-                    sanitize_terminal_text(&message),
-                    crate::state::NotificationKind::Error,
-                ));
-                self.state.notification_ticks_remaining = 50;
-                self.updater_task = None;
-            }
-            Action::UpdateFailed { message } => {
-                self.state.updater.in_progress = false;
-                self.state.updater.phase = UpdaterPhase::Failed;
-                self.state.updater.status_text = String::from("failed");
-                self.state.notification = Some((
-                    sanitize_terminal_text(&message),
-                    crate::state::NotificationKind::Error,
-                ));
-                self.state.notification_ticks_remaining = 50;
-                self.updater_task = None;
             }
             Action::RequestStarted {
                 request_id,
