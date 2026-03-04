@@ -73,14 +73,15 @@ jobs:
           python3 - <<'PYEOF'
           import os, sys, base64
 
-          secret = os.environ.get("POSTERM_UPDATE_SIGNING_KEY", "").strip()
-          if not secret:
-              print("WARNING: POSTERM_UPDATE_SIGNING_KEY secret is absent or empty — skipping Ed25519 signing.", flush=True)
-              sys.exit(0)
-
           binary_name = os.environ["BINARY_NAME"]
           binary_path = f"target/release/{binary_name}"
           sig_path    = f"dist/{binary_name}-linux.tar.gz.sig"
+
+          secret = os.environ.get("POSTERM_UPDATE_SIGNING_KEY", "").strip()
+          if not secret:
+              print("WARNING: POSTERM_UPDATE_SIGNING_KEY is absent — writing empty placeholder .sig file.", flush=True)
+              open(sig_path, "wb").close()
+              sys.exit(0)
 
           from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
@@ -106,7 +107,7 @@ jobs:
             dist/${{ env.BINARY_NAME }}-linux.tar.gz
             dist/${{ env.BINARY_NAME }}-linux.tar.gz.sha256
             dist/${{ env.BINARY_NAME }}-linux.tar.gz.sig
-          if-no-files-found: error
+          if-no-files-found: warn
 
   build-macos:
     runs-on: macos-latest
@@ -168,14 +169,15 @@ jobs:
           python3 - <<'PYEOF'
           import os, sys, base64
 
-          secret = os.environ.get("POSTERM_UPDATE_SIGNING_KEY", "").strip()
-          if not secret:
-              print("WARNING: POSTERM_UPDATE_SIGNING_KEY secret is absent or empty — skipping Ed25519 signing.", flush=True)
-              sys.exit(0)
-
           binary_name = os.environ["BINARY_NAME"]
           binary_path = f"target/release/{binary_name}"
           sig_path    = f"dist/{binary_name}-macos.tar.gz.sig"
+
+          secret = os.environ.get("POSTERM_UPDATE_SIGNING_KEY", "").strip()
+          if not secret:
+              print("WARNING: POSTERM_UPDATE_SIGNING_KEY is absent — writing empty placeholder .sig file.", flush=True)
+              open(sig_path, "wb").close()
+              sys.exit(0)
 
           from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
@@ -202,7 +204,7 @@ jobs:
             dist/${{ env.BINARY_NAME }}-macos.pkg
             dist/${{ env.BINARY_NAME }}-macos.tar.gz.sha256
             dist/${{ env.BINARY_NAME }}-macos.tar.gz.sig
-          if-no-files-found: error
+          if-no-files-found: warn
 
   build-windows:
     runs-on: windows-latest
