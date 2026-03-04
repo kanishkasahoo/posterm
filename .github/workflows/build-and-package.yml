@@ -1,11 +1,12 @@
 name: Build and Package
 
 on:
-  push:
-    branches:
-      - main
-      - master
-  pull_request:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version tag (for example, v1.2.3)
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -15,15 +16,10 @@ env:
   BINARY_NAME: posterm
 
 jobs:
-  build-test-package:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - ubuntu-latest
-          - windows-latest
-          - macos-latest
+  build-ubuntu:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout source
@@ -44,13 +40,53 @@ jobs:
         run: cargo build --release --locked
 
       - name: Package Linux binary
-        if: matrix.os == 'ubuntu-latest'
         run: |
           mkdir -p dist
           tar -czf "dist/${BINARY_NAME}-linux.tar.gz" -C target/release "${BINARY_NAME}"
 
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-ubuntu
+          path: dist/${{ env.BINARY_NAME }}-linux.tar.gz
+          if-no-files-found: error
+
+  build-macos:
+    runs-on: macos-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Validate release version input
+        id: validate_version
+        env:
+          VERSION_INPUT: ${{ github.event.inputs.version }}
+        run: |
+          if [[ ! "$VERSION_INPUT" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+            echo "Invalid version input: $VERSION_INPUT" >&2
+            exit 1
+          fi
+          echo "version=$VERSION_INPUT" >> "$GITHUB_OUTPUT"
+          echo "RELEASE_VERSION=$VERSION_INPUT" >> "$GITHUB_ENV"
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Use stable Rust
+        run: rustup default stable
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
       - name: Package macOS binary and PKG installer
-        if: matrix.os == 'macos-latest'
         run: |
           mkdir -p dist
           tar -czf "dist/${BINARY_NAME}-macos.tar.gz" -C target/release "${BINARY_NAME}"
@@ -61,12 +97,43 @@ jobs:
           pkgbuild \
             --root pkgroot \
             --identifier "io.github.posterm.${BINARY_NAME}" \
-            --version "${{ github.run_number }}" \
+            --version "$RELEASE_VERSION" \
             --install-location "/" \
             "dist/${BINARY_NAME}-macos.pkg"
 
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-macos
+          path: |
+            dist/${{ env.BINARY_NAME }}-macos.tar.gz
+            dist/${{ env.BINARY_NAME }}-macos.pkg
+          if-no-files-found: error
+
+  build-windows:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Use stable Rust
+        run: rustup default stable
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
       - name: Install WiX Toolset
-        if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
           choco install wixtoolset --no-progress -y
@@ -76,7 +143,6 @@ jobs:
           }
 
       - name: Build Windows MSI installer
-        if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
           cargo install cargo-wix --locked
@@ -89,30 +155,66 @@ jobs:
           }
           Copy-Item $msi.FullName "dist\${env:BINARY_NAME}-windows.msi"
 
-      - name: Upload Linux artifacts
-        if: matrix.os == 'ubuntu-latest'
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.BINARY_NAME }}-${{ matrix.os }}
-          path: dist/${{ env.BINARY_NAME }}-linux.tar.gz
-          if-no-files-found: error
-
-      - name: Upload macOS artifacts
-        if: matrix.os == 'macos-latest'
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.BINARY_NAME }}-${{ matrix.os }}
-          path: |
-            dist/${{ env.BINARY_NAME }}-macos.tar.gz
-            dist/${{ env.BINARY_NAME }}-macos.pkg
-          if-no-files-found: error
-
       - name: Upload Windows artifacts
-        if: matrix.os == 'windows-latest'
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.BINARY_NAME }}-${{ matrix.os }}
+          name: ${{ env.BINARY_NAME }}-windows
           path: |
             dist/${{ env.BINARY_NAME }}-windows.zip
             dist/${{ env.BINARY_NAME }}-windows.msi
           if-no-files-found: error
+
+  release:
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    needs:
+      - build-ubuntu
+      - build-macos
+      - build-windows
+    permissions:
+      contents: write
+
+    steps:
+      - name: Validate release version input
+        id: validate_version
+        env:
+          VERSION_INPUT: ${{ github.event.inputs.version }}
+        run: |
+          if [[ ! "$VERSION_INPUT" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+            echo "Invalid version input: $VERSION_INPUT" >&2
+            exit 1
+          fi
+          echo "version=$VERSION_INPUT" >> "$GITHUB_OUTPUT"
+          echo "RELEASE_VERSION=$VERSION_INPUT" >> "$GITHUB_ENV"
+
+      - name: Download Ubuntu artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-ubuntu
+          path: release-assets/ubuntu
+
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-macos
+          path: release-assets/macos
+
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-windows
+          path: release-assets/windows
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b
+        with:
+          tag_name: ${{ steps.validate_version.outputs.version }}
+          name: ${{ steps.validate_version.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          fail_on_unmatched_files: true
+          files: |
+            release-assets/ubuntu/${{ env.BINARY_NAME }}-linux.tar.gz
+            release-assets/macos/${{ env.BINARY_NAME }}-macos.tar.gz
+            release-assets/macos/${{ env.BINARY_NAME }}-macos.pkg
+            release-assets/windows/${{ env.BINARY_NAME }}-windows.zip
+            release-assets/windows/${{ env.BINARY_NAME }}-windows.msi
