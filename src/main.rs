@@ -27,6 +27,10 @@ async fn main() -> std::io::Result<()> {
             print_usage();
             return Ok(());
         }
+        Some("version") | Some("--version") | Some("-V") => {
+            println!("posterm {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
         Some(unknown) => {
             eprintln!("error: unknown subcommand '{unknown}'");
             eprintln!();
@@ -54,9 +58,14 @@ fn print_usage() {
     println!("posterm — a terminal HTTP client");
     println!();
     println!("USAGE:");
-    println!("  posterm           Start the interactive TUI");
-    println!("  posterm upgrade   Check for and apply the latest release");
-    println!("  posterm help      Show this help message");
+    println!("  posterm             Start the interactive TUI");
+    println!("  posterm upgrade     Check for and apply the latest release");
+    println!("  posterm version     Print version information and exit");
+    println!("  posterm help        Show this help message");
+    println!();
+    println!("FLAGS:");
+    println!("  -h, --help          Show this help message");
+    println!("  -V, --version       Print version information and exit");
 }
 
 fn apply_update_on_exit() {
