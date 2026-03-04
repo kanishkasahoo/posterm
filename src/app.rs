@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
@@ -48,9 +49,13 @@ pub struct App {
     http_pool: HttpClientPool,
     action_sender: mpsc::Sender<Action>,
     action_receiver: mpsc::Receiver<Action>,
-    request_task: Option<JoinHandle<()>>,
-    request_cancel_sender: Option<watch::Sender<bool>>,
+    /// Per-request task handles, keyed by request_id.
+    request_tasks: HashMap<u64, JoinHandle<()>>,
+    /// Per-request cancellation senders, keyed by request_id.
+    request_cancel_senders: HashMap<u64, watch::Sender<bool>>,
     next_request_id: u64,
+    /// The request_id currently displayed in the response pane.
+    active_response_id: Option<u64>,
     pending_response_search_bytes: usize,
     persistence: PersistenceManager,
 }
@@ -80,9 +85,10 @@ impl App {
             http_pool: HttpClientPool::new().expect("failed to initialize HTTP client pool"),
             action_sender,
             action_receiver,
-            request_task: None,
-            request_cancel_sender: None,
+            request_tasks: HashMap::new(),
+            request_cancel_senders: HashMap::new(),
             next_request_id: 1,
+            active_response_id: None,
             pending_response_search_bytes: 0,
             persistence: PersistenceManager::new(),
         }
@@ -112,7 +118,7 @@ impl App {
             for action in next_actions {
                 self.process_action(action, tui)?;
                 if self.state.should_quit {
-                    self.cancel_in_flight_request();
+                    self.cancel_all_in_flight_requests();
                     return Ok(());
                 }
             }
@@ -164,25 +170,33 @@ impl App {
                 self.sidebar.render(frame, sidebar_area, &self.state);
             }
 
+            let is_small = matches!(self.state.layout_mode, LayoutMode::Small);
             let use_horizontal_split =
-                !matches!(self.state.layout_mode, LayoutMode::Small)
-                    && content_area.width >= HORIZONTAL_MIN_WIDTH;
+                !is_small && content_area.width >= HORIZONTAL_MIN_WIDTH;
 
-            let main_chunks = if use_horizontal_split {
-                Layout::horizontal([
-                    Constraint::Min(MIN_REQUEST_PANE_WIDTH),
-                    Constraint::Min(MIN_RESPONSE_PANE_WIDTH),
-                ])
-                .split(content_area)
+            if is_small {
+                // In Small mode: show only one pane at a time (full content_area).
+                if self.state.small_mode_show_response {
+                    self.response_viewer.render(frame, content_area, &self.state);
+                } else {
+                    self.request_builder.render(frame, content_area, &self.state);
+                }
             } else {
-                Layout::vertical([Constraint::Percentage(52), Constraint::Percentage(48)])
+                let main_chunks = if use_horizontal_split {
+                    Layout::horizontal([
+                        Constraint::Min(MIN_REQUEST_PANE_WIDTH),
+                        Constraint::Min(MIN_RESPONSE_PANE_WIDTH),
+                    ])
                     .split(content_area)
-            };
-
-            self.request_builder
-                .render(frame, main_chunks[0], &self.state);
-            self.response_viewer
-                .render(frame, main_chunks[1], &self.state);
+                } else {
+                    Layout::vertical([Constraint::Percentage(52), Constraint::Percentage(48)])
+                        .split(content_area)
+                };
+                self.request_builder
+                    .render(frame, main_chunks[0], &self.state);
+                self.response_viewer
+                    .render(frame, main_chunks[1], &self.state);
+            }
             self.status_bar
                 .render(frame, pane_layout.status, &self.state);
 
@@ -210,6 +224,18 @@ impl App {
         if self.state.help_visible {
             if Self::is_help_shortcut(key_event) {
                 return vec![Action::ToggleHelp, Action::Render];
+            }
+            if key_event.code == KeyCode::Down || key_event.code == KeyCode::Char('j') {
+                return vec![Action::ScrollHelp(1), Action::Render];
+            }
+            if key_event.code == KeyCode::Up || key_event.code == KeyCode::Char('k') {
+                return vec![Action::ScrollHelp(-1), Action::Render];
+            }
+            if key_event.code == KeyCode::PageDown {
+                return vec![Action::ScrollHelp(10), Action::Render];
+            }
+            if key_event.code == KeyCode::PageUp {
+                return vec![Action::ScrollHelp(-10), Action::Render];
             }
             if key_event.code == KeyCode::Esc {
                 return vec![Action::CloseHelp, Action::Render];
@@ -239,6 +265,14 @@ impl App {
             return vec![Action::ToggleSidebar, Action::Render];
         }
 
+        // Ctrl+R toggles between request builder and response viewer in Small mode.
+        if matches!(self.state.layout_mode, LayoutMode::Small)
+            && key_event.code == KeyCode::Char('r')
+            && key_event.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            return vec![Action::ToggleSmallModePane, Action::Render];
+        }
+
         // When sidebar is focused, delegate navigation keys to sidebar actions.
         if self.state.sidebar_focused {
             return self.handle_sidebar_focused_key(key_event);
@@ -255,10 +289,22 @@ impl App {
                 return vec![Action::CancelRequest, Action::Render];
             }
             (KeyCode::Tab, _) => {
-                return vec![Action::FocusNext, Action::Render];
+                let mut acts = vec![Action::FocusNext, Action::Render];
+                if self.state.request.focus == crate::state::RequestFocus::Editor
+                    && self.state.request.active_tab == RequestTab::Params
+                {
+                    acts.insert(0, Action::SyncUrlFromParams);
+                }
+                return acts;
             }
             (KeyCode::BackTab, _) => {
-                return vec![Action::FocusPrev, Action::Render];
+                let mut acts = vec![Action::FocusPrev, Action::Render];
+                if self.state.request.focus == crate::state::RequestFocus::Editor
+                    && self.state.request.active_tab == RequestTab::Params
+                {
+                    acts.insert(0, Action::SyncUrlFromParams);
+                }
+                return acts;
             }
             (KeyCode::Esc, _) if self.state.response.search.active => {
                 return vec![Action::CloseResponseSearch, Action::Render];
@@ -471,6 +517,37 @@ impl App {
             KeyCode::Char('4') => {
                 self.state.request.active_tab = RequestTab::Body;
                 vec![Action::Render]
+            }
+            KeyCode::Char('n') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                match self.state.request.active_tab {
+                    RequestTab::Params => {
+                        if self.state.request.query_params.len() < MAX_QUERY_PARAM_ROWS {
+                            vec![Action::AddQueryParam, Action::Render]
+                        } else {
+                            Vec::new()
+                        }
+                    }
+                    RequestTab::Headers => {
+                        if self.state.request.headers.len() < MAX_HEADER_ROWS {
+                            vec![Action::AddHeader, Action::Render]
+                        } else {
+                            Vec::new()
+                        }
+                    }
+                    RequestTab::Body => {
+                        if self.state.request.body_format == BodyFormat::Form
+                            && self.state.request.body_form.len() < MAX_BODY_FORM_ROWS
+                        {
+                            vec![
+                                Action::SetBodyContent(BodyContent::AddFormRow),
+                                Action::Render,
+                            ]
+                        } else {
+                            Vec::new()
+                        }
+                    }
+                    RequestTab::Auth => Vec::new(),
+                }
             }
             _ => Vec::new(),
         }
@@ -748,11 +825,17 @@ impl App {
                     editor.selected_row -= 1;
                     editor.cursor = 0;
                 }
+                if is_params {
+                    actions.push(Action::SyncUrlFromParams);
+                }
             }
             KeyCode::Down => {
                 if rows_len > 0 {
                     editor.selected_row = (editor.selected_row + 1).min(rows_len - 1);
                     editor.cursor = 0;
+                }
+                if is_params {
+                    actions.push(Action::SyncUrlFromParams);
                 }
             }
             KeyCode::Left => {
@@ -771,6 +854,9 @@ impl App {
             KeyCode::Enter => {
                 editor.active_field = editor.active_field.toggle();
                 editor.cursor = self.editor_field_len(is_params, editor).min(editor.cursor);
+                if is_params {
+                    actions.push(Action::SyncUrlFromParams);
+                }
             }
             KeyCode::Char('n') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
                 let max_rows = if is_params {
@@ -786,6 +872,9 @@ impl App {
                 } else {
                     Action::AddHeader
                 });
+                if is_params {
+                    actions.push(Action::SyncUrlFromParams);
+                }
                 let next_row = rows_len;
                 editor.selected_row = next_row;
                 editor.active_field = KeyValueField::Key;
@@ -799,6 +888,9 @@ impl App {
                     } else {
                         Action::RemoveHeader(index)
                     });
+                    if is_params {
+                        actions.push(Action::SyncUrlFromParams);
+                    }
 
                     if index > 0 {
                         editor.selected_row = index - 1;
@@ -935,10 +1027,6 @@ impl App {
             actions.push(Action::SetQueryParam { index, row });
         } else {
             actions.push(Action::SetHeader { index, row });
-        }
-
-        if is_params {
-            actions.push(Action::SyncUrlFromParams);
         }
     }
 
@@ -1203,13 +1291,6 @@ impl App {
     }
 
     fn start_request_execution(&mut self) {
-        if self.state.response.in_flight.is_some() || self.request_task.is_some() {
-            self.state.response.last_error = Some(String::from(
-                "A request is already in flight. Press Ctrl+C to cancel it first.",
-            ));
-            return;
-        }
-
         let effective_url = rebuild_url_with_params(
             &self.state.request.url,
             &self.state.request.query_params,
@@ -1231,13 +1312,18 @@ impl App {
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
 
+        // This new request becomes the active context; clear display state.
+        self.active_response_id = Some(request_id);
+        self.state.response = crate::state::ResponseState::default();
+        self.state.response.last_request_id = Some(request_id);
+
         let request_state = self.state.request.clone();
         let action_sender = self.action_sender.clone();
         let pool = self.http_pool.clone();
         let (cancel_sender, mut cancel_receiver) = watch::channel(false);
 
-        self.request_cancel_sender = Some(cancel_sender);
-        self.request_task = Some(tokio::spawn(async move {
+        self.request_cancel_senders.insert(request_id, cancel_sender);
+        self.request_tasks.insert(request_id, tokio::spawn(async move {
             let _ = execute_request(
                 &pool,
                 &request_state,
@@ -1250,21 +1336,39 @@ impl App {
         }));
     }
 
-    fn cancel_in_flight_request(&self) {
-        if let Some(cancel_sender) = &self.request_cancel_sender {
+    /// Cancel only the active response context's in-flight request.
+    fn cancel_active_in_flight_request(&self) {
+        if let Some(id) = self.active_response_id
+            && let Some(cancel_sender) = self.request_cancel_senders.get(&id)
+        {
             let _ = cancel_sender.send(true);
         }
     }
 
-    fn clear_runtime_request_handles(&mut self) {
-        self.request_task = None;
-        self.request_cancel_sender = None;
+    /// Cancel all in-flight requests (used on quit).
+    fn cancel_all_in_flight_requests(&self) {
+        for cancel_sender in self.request_cancel_senders.values() {
+            let _ = cancel_sender.send(true);
+        }
+    }
+
+    /// Clean up task and cancel sender for a completed/cancelled request.
+    fn cleanup_request_handles(&mut self, request_id: u64) {
+        self.request_tasks.remove(&request_id);
+        self.request_cancel_senders.remove(&request_id);
     }
 
     fn apply_action(&mut self, action: Action) {
         match action {
             Action::Tick => {
                 self.persistence.flush_pending(&self.state);
+                // Tick down notification timer
+                if self.state.notification_ticks_remaining > 0 {
+                    self.state.notification_ticks_remaining -= 1;
+                    if self.state.notification_ticks_remaining == 0 {
+                        self.state.notification = None;
+                    }
+                }
             }
             Action::Render => {}
             Action::Resize(width, height) => {
@@ -1290,6 +1394,7 @@ impl App {
                 self.state.request.url = url;
                 let len = self.state.request.url.chars().count();
                 self.state.request.url_cursor = self.state.request.url_cursor.min(len);
+                self.state.request.url_error = None;
             }
             Action::SyncUrlFromParams => {
                 if self.state.request.sync_guard == Some(SyncDirection::UrlToParams) {
@@ -1527,6 +1632,29 @@ impl App {
                 }
             },
             Action::SendRequest => {
+                let url = self.state.request.url.trim().to_string();
+                if url.is_empty() {
+                    self.state.request.url_error =
+                        Some(String::from("URL cannot be empty"));
+                    self.state.notification = Some((
+                        String::from("URL cannot be empty — set a URL before sending"),
+                        crate::state::NotificationKind::Error,
+                    ));
+                    self.state.notification_ticks_remaining = 50;
+                    return;
+                }
+                if !url.starts_with("http://") && !url.starts_with("https://") {
+                    self.state.request.url_error =
+                        Some(String::from("URL must start with http:// or https://"));
+                    self.state.notification = Some((
+                        String::from("Invalid URL — must start with http:// or https://"),
+                        crate::state::NotificationKind::Error,
+                    ));
+                    self.state.notification_ticks_remaining = 50;
+                    return;
+                }
+                // Clear any previous error and send
+                self.state.request.url_error = None;
                 self.state.response.last_error = None;
                 self.state.response.cancelled = false;
                 self.start_request_execution();
@@ -1535,34 +1663,39 @@ impl App {
                 if let Some(in_flight) = self.state.response.in_flight.as_mut() {
                     in_flight.cancellation_requested = true;
                 }
-                self.cancel_in_flight_request();
+                self.cancel_active_in_flight_request();
             }
             Action::RequestStarted {
                 request_id,
                 method,
                 url,
             } => {
-                self.state.response.last_request_id = Some(request_id);
-                self.state.response.in_flight = Some(InFlightRequest {
+                let record = InFlightRequest {
                     id: request_id,
                     method,
-                    url,
+                    url: url.clone(),
                     cancellation_requested: false,
-                });
-                self.state.response.buffer.clear();
-                self.state.response.scroll_offset = 0;
-                self.state.response.horizontal_scroll_offset = 0;
-                self.state.response.metadata = None;
-                self.state.response.last_error = None;
-                self.state.response.cancelled = false;
-                self.state.response.truncated = false;
-                self.recompute_response_search();
+                };
+                self.state.in_flight_requests.insert(request_id, record.clone());
+                if self.active_response_id == Some(request_id) {
+                    self.state.response.last_request_id = Some(request_id);
+                    self.state.response.in_flight = Some(record);
+                    self.state.response.buffer.clear();
+                    self.state.response.scroll_offset = 0;
+                    self.state.response.horizontal_scroll_offset = 0;
+                    self.state.response.metadata = None;
+                    self.state.response.last_error = None;
+                    self.state.response.cancelled = false;
+                    self.state.response.truncated = false;
+                    self.recompute_response_search();
+                }
             }
             Action::RequestCompleted {
                 request_id,
                 mut metadata,
             } => {
-                if self.state.response.last_request_id == Some(request_id) {
+                self.state.in_flight_requests.remove(&request_id);
+                if self.active_response_id == Some(request_id) {
                     metadata.truncated = self.state.response.truncated;
                     self.state.response.metadata = Some(metadata.clone());
                     self.state.response.in_flight = None;
@@ -1571,7 +1704,11 @@ impl App {
                     self.state.response.scroll_offset =
                         self.state.response.scroll_offset.min(max_scroll);
                     self.recompute_response_search();
-                    self.clear_runtime_request_handles();
+                    // In Small mode, automatically show the response pane when a request completes.
+                    if matches!(self.state.layout_mode, LayoutMode::Small) {
+                        self.state.small_mode_show_response = true;
+                    }
+                    self.cleanup_request_handles(request_id);
 
                     // Auto-record to history.
                     let timestamp_secs = SystemTime::now()
@@ -1593,26 +1730,38 @@ impl App {
                     self.state.history.insert(0, entry);
                     self.state.history.truncate(self.state.config.history_limit);
                     self.persistence.schedule_save(PersistTarget::History);
+                } else {
+                    // Background request completed — clean up silently.
+                    self.cleanup_request_handles(request_id);
                 }
             }
             Action::RequestFailed { request_id, error } => {
-                if self.state.response.last_request_id == Some(request_id) {
+                self.state.in_flight_requests.remove(&request_id);
+                if self.active_response_id == Some(request_id) {
                     self.state.response.last_error = Some(sanitize_terminal_text(&error));
                     self.state.response.in_flight = None;
                     self.recompute_response_search();
-                    self.clear_runtime_request_handles();
+                    // In Small mode, automatically show the response pane when a request fails.
+                    if matches!(self.state.layout_mode, LayoutMode::Small) {
+                        self.state.small_mode_show_response = true;
+                    }
+                    self.cleanup_request_handles(request_id);
+                } else {
+                    // Background request failed — clean up silently.
+                    self.cleanup_request_handles(request_id);
                 }
             }
             Action::RequestCancelled { request_id } => {
-                if self.state.response.last_request_id == Some(request_id) {
+                self.state.in_flight_requests.remove(&request_id);
+                if self.active_response_id == Some(request_id) {
                     self.state.response.in_flight = None;
                     self.state.response.cancelled = true;
                     self.recompute_response_search();
-                    self.clear_runtime_request_handles();
                 }
+                self.cleanup_request_handles(request_id);
             }
             Action::ResponseChunk { request_id, chunk } => {
-                if self.state.response.last_request_id == Some(request_id) {
+                if self.active_response_id == Some(request_id) {
                     let chunk_len = chunk.len();
                     self.state.response.buffer.append_chunk(&chunk);
                     self.state.response.truncated = self.state.response.buffer.is_truncated();
@@ -1629,6 +1778,8 @@ impl App {
                         }
                     }
                 }
+                // Chunks for non-active requests are discarded — the background
+                // task drains to completion but we don't buffer the data.
             }
             Action::ScrollResponse(delta) => {
                 let max_scroll = response_scroll_upper_bound(&self.state.response);
@@ -1731,9 +1882,26 @@ impl App {
             }
             Action::ToggleHelp => {
                 self.state.help_visible = !self.state.help_visible;
+                if !self.state.help_visible {
+                    self.state.help_scroll = 0;
+                }
             }
             Action::CloseHelp => {
                 self.state.help_visible = false;
+                self.state.help_scroll = 0;
+            }
+            Action::ScrollHelp(delta) => {
+                // Max lines in the help content (keep in sync with help_modal.rs line count).
+                const HELP_CONTENT_LINES: usize = 34;
+                let visible = self.state.terminal_size.1.saturating_sub(6) as usize;
+                let max_scroll = HELP_CONTENT_LINES.saturating_sub(visible);
+                if delta < 0 {
+                    self.state.help_scroll =
+                        self.state.help_scroll.saturating_sub((-delta) as usize);
+                } else {
+                    self.state.help_scroll =
+                        (self.state.help_scroll + delta as usize).min(max_scroll);
+                }
             }
 
             // ── Collections ──────────────────────────────────────────────────
@@ -1799,23 +1967,23 @@ impl App {
                 request,
                 name,
             } => {
-                if let Some(col) = self.state.collections.get_mut(collection) {
-                    if let Some(req) = col.requests.get_mut(request) {
-                        req.name = name;
-                        let id = col.id.clone();
-                        self.persistence
-                            .schedule_save(PersistTarget::Collection(id));
-                    }
+                if let Some(col) = self.state.collections.get_mut(collection)
+                    && let Some(req) = col.requests.get_mut(request)
+                {
+                    req.name = name;
+                    let id = col.id.clone();
+                    self.persistence
+                        .schedule_save(PersistTarget::Collection(id));
                 }
             }
             Action::DeleteCollectionRequest { collection, request } => {
-                if let Some(col) = self.state.collections.get_mut(collection) {
-                    if request < col.requests.len() {
-                        col.requests.remove(request);
-                        let id = col.id.clone();
-                        self.persistence
-                            .schedule_save(PersistTarget::Collection(id));
-                    }
+                if let Some(col) = self.state.collections.get_mut(collection)
+                    && request < col.requests.len()
+                {
+                    col.requests.remove(request);
+                    let id = col.id.clone();
+                    self.persistence
+                        .schedule_save(PersistTarget::Collection(id));
                 }
                 // Reset sidebar selection if it pointed at the deleted request.
                 match &self.state.sidebar_selected_item {
@@ -1842,7 +2010,7 @@ impl App {
 
             // ── History ───────────────────────────────────────────────────────
             Action::RecordHistory(entry) => {
-                self.state.history.insert(0, entry);
+                self.state.history.insert(0, *entry);
                 self.state.history.truncate(self.state.config.history_limit);
                 self.persistence.schedule_save(PersistTarget::History);
             }
@@ -1869,12 +2037,11 @@ impl App {
                     self.state.sidebar_focused = !self.state.sidebar_focused;
                 } else {
                     self.state.sidebar_visible = !self.state.sidebar_visible;
-                    if !self.state.sidebar_visible {
-                        self.state.sidebar_focused = false;
-                    } else {
-                        self.state.sidebar_focused = true;
-                    }
+                    self.state.sidebar_focused = self.state.sidebar_visible;
                 }
+            }
+            Action::ToggleSmallModePane => {
+                self.state.small_mode_show_response = !self.state.small_mode_show_response;
             }
             Action::SidebarFocusNext => {
                 self.sidebar_navigate(1);
@@ -1918,6 +2085,19 @@ impl App {
             // ── Persistence ───────────────────────────────────────────────────
             Action::PersistenceError(msg) => {
                 eprintln!("[posterm] persistence error: {msg}");
+                self.state.notification =
+                    Some((msg, crate::state::NotificationKind::Error));
+                self.state.notification_ticks_remaining = 50;
+            }
+
+            // ── Notifications ─────────────────────────────────────────────────
+            Action::ShowNotification { message, kind } => {
+                self.state.notification = Some((message, kind));
+                self.state.notification_ticks_remaining = 50;
+            }
+            Action::DismissNotification => {
+                self.state.notification = None;
+                self.state.notification_ticks_remaining = 0;
             }
         }
     }
@@ -2986,6 +3166,7 @@ mod tests {
     #[tokio::test]
     async fn response_chunks_do_not_recompute_search_when_inactive() {
         let mut app = App::new((120, 40));
+        app.active_response_id = Some(7);
         app.state.response.last_request_id = Some(7);
         app.state.response.search.query = String::from("a");
 
@@ -3001,6 +3182,7 @@ mod tests {
     #[tokio::test]
     async fn response_chunks_throttle_search_recompute_until_threshold() {
         let mut app = App::new((120, 40));
+        app.active_response_id = Some(7);
         app.state.response.last_request_id = Some(7);
         app.apply_action(Action::OpenResponseSearch);
         app.apply_action(Action::SearchInResponse(String::from("a")));
@@ -3029,6 +3211,7 @@ mod tests {
     #[tokio::test]
     async fn request_completion_forces_final_search_recompute() {
         let mut app = App::new((120, 40));
+        app.active_response_id = Some(7);
         app.state.response.last_request_id = Some(7);
         app.apply_action(Action::OpenResponseSearch);
         app.apply_action(Action::SearchInResponse(String::from("z")));

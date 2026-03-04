@@ -1,7 +1,7 @@
-use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::Frame;
 
 use crate::state::{RequestFocus, RequestState};
 
@@ -26,10 +26,22 @@ impl UrlBar {
             .style(Style::default().fg(Color::Cyan));
         frame.render_widget(method, sections[0]);
 
-        let url_title_style = if request.focus == RequestFocus::Url {
-            Style::default().fg(Color::Yellow)
+        // Determine URL border and title styles based on error state or focus.
+        let (url_border_style, url_title_style) = if request.url_error.is_some() {
+            (
+                Style::default().fg(Color::Red),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )
+        } else if request.focus == RequestFocus::Url {
+            (Style::default(), Style::default().fg(Color::Yellow))
         } else {
-            Style::default()
+            (Style::default(), Style::default())
+        };
+
+        let url_title = if let Some(err) = &request.url_error {
+            format!("URL — {err}")
+        } else {
+            String::from("URL")
         };
 
         let input_width = usize::from(sections[1].width.saturating_sub(2));
@@ -43,8 +55,9 @@ impl UrlBar {
 
         let url = Paragraph::new(visible).block(
             Block::default()
-                .title("URL")
+                .title(url_title)
                 .title_style(url_title_style)
+                .border_style(url_border_style)
                 .borders(Borders::ALL),
         );
         frame.render_widget(url, sections[1]);

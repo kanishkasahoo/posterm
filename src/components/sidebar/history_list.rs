@@ -1,7 +1,9 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
+use ratatui::widgets::{
+    Block, Borders, List, ListItem, ListState, Scrollbar, ScrollbarOrientation, ScrollbarState,
+};
 use ratatui::Frame;
 
 use crate::state::{AppState, SidebarItem};
@@ -85,6 +87,20 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let list = List::new(items).block(Block::default().title("History").borders(Borders::TOP));
 
     frame.render_stateful_widget(list, area, &mut list_state);
+
+    // Vertical scrollbar when history overflows.
+    let total_items = state.history.len();
+    let visible_items = usize::from(area.height.saturating_sub(2));
+    if total_items > visible_items {
+        let scroll_pos = selected_flat.unwrap_or(0);
+        let mut sb_state =
+            ScrollbarState::new(total_items.saturating_sub(visible_items)).position(scroll_pos);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+            area,
+            &mut sb_state,
+        );
+    }
 }
 
 /// Returns a style appropriate for the HTTP status code.

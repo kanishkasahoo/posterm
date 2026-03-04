@@ -1,7 +1,9 @@
-use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Text};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+};
+use ratatui::Frame;
 
 use crate::state::{AppState, ResponseSearchScope};
 
@@ -52,6 +54,17 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     }
 
     frame.render_widget(widget, area);
+
+    let total_lines = lines.len();
+    if total_lines > inner_height {
+        let mut sb_state =
+            ScrollbarState::new(total_lines.saturating_sub(inner_height)).position(vertical_scroll);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+            area,
+            &mut sb_state,
+        );
+    }
 }
 
 pub(crate) fn raw_lines(state: &AppState) -> Vec<String> {

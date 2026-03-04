@@ -1,7 +1,9 @@
-use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Color, Style, Stylize};
-use ratatui::widgets::{Block, Borders, Cell, Row, Table};
+use ratatui::widgets::{
+    Block, Borders, Cell, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table, TableState,
+};
+use ratatui::Frame;
 
 use crate::state::{KeyValueEditorState, KeyValueField, KeyValueRow, RequestFocus};
 
@@ -67,5 +69,30 @@ pub fn render_editor(
     )
     .row_highlight_style(Style::default().bg(Color::DarkGray));
 
-    frame.render_widget(table, area);
+    // Use stateful render so ratatui auto-scrolls to keep selected_row visible.
+    let selected = if focus == RequestFocus::Editor {
+        Some(editor_state.selected_row)
+    } else {
+        None
+    };
+    let mut table_state = TableState::default().with_selected(selected);
+    frame.render_stateful_widget(table, area, &mut table_state);
+
+    // Vertical scrollbar when rows overflow the visible area.
+    // Header takes 1 row + 2 border rows = 3 overhead rows.
+    let total_data_rows = rows.len().max(1);
+    let visible_rows = usize::from(area.height.saturating_sub(3)); // borders + header
+    if total_data_rows > visible_rows {
+        let mut sb_state = ScrollbarState::new(total_data_rows.saturating_sub(visible_rows))
+            .position(
+                editor_state
+                    .selected_row
+                    .min(total_data_rows.saturating_sub(1)),
+            );
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+            area,
+            &mut sb_state,
+        );
+    }
 }

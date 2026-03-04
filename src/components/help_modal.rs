@@ -1,12 +1,14 @@
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{
+    Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+};
 use ratatui::Frame;
 
 use crate::state::AppState;
 
-pub fn render(frame: &mut Frame<'_>, area: Rect, _state: &AppState) {
+pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let modal_width = area.width.saturating_sub(4).clamp(60, 100);
     let modal_height = area.height.saturating_sub(4).clamp(20, 38);
     let modal_area = centered_rect(modal_width, modal_height, area);
@@ -14,7 +16,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, _state: &AppState) {
     frame.render_widget(Clear, modal_area);
 
     let block = Block::default()
-        .title("Keyboard Shortcuts")
+        .title("Keyboard Shortcuts  (↑↓/j/k/PgUp/PgDn to scroll)")
         .title_style(Style::default().fg(Color::Yellow))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
@@ -25,7 +27,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, _state: &AppState) {
         return;
     }
 
-    let lines = vec![
+    let all_lines: Vec<Line> = vec![
         Line::from("Global"),
         Line::from("  F1             Toggle help"),
         Line::from("  Ctrl+Q         Quit"),
@@ -39,6 +41,9 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, _state: &AppState) {
         Line::from("  Up/Down        Navigate items"),
         Line::from("  Enter/Space    Expand collection or load request/history entry"),
         Line::from("  Esc            Close / unfocus sidebar"),
+        Line::from(""),
+        Line::from("Small Mode"),
+        Line::from("  Ctrl+R         Toggle between Request Builder and Response Viewer"),
         Line::from(""),
         Line::from("Response"),
         Line::from("  Ctrl+F         Open search input"),
@@ -59,12 +64,34 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, _state: &AppState) {
         Line::from("  Params/Headers/Form: Enter switch key/value, arrows/Home/End move cursor"),
     ];
 
+    let total_lines = all_lines.len();
+    let inner_height = usize::from(inner.height);
+    let max_scroll = total_lines.saturating_sub(inner_height);
+    let scroll = state.help_scroll.min(max_scroll);
+
+    let visible_lines: Vec<Line> = all_lines
+        .into_iter()
+        .skip(scroll)
+        .take(inner_height)
+        .collect();
+
     frame.render_widget(
-        Paragraph::new(lines)
+        Paragraph::new(visible_lines)
             .alignment(Alignment::Left)
             .style(Style::default().fg(Color::White)),
         inner,
     );
+
+    // Scrollbar overlay on the modal border (right side).
+    if total_lines > inner_height {
+        let mut sb_state =
+            ScrollbarState::new(total_lines.saturating_sub(inner_height)).position(scroll);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+            modal_area,
+            &mut sb_state,
+        );
+    }
 }
 
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {

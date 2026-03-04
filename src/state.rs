@@ -1,7 +1,17 @@
+use std::collections::HashMap;
 use std::fmt;
 
 use crate::persistence::{AppConfig, Collection, HistoryEntry};
 use crate::util::streaming_buffer::StreamingBuffer;
+
+// The Info variant is part of the public notification API and will be used by
+// future callers dispatching ShowNotification actions.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotificationKind {
+    Info,
+    Error,
+}
 
 pub const MAX_URL_LENGTH: usize = 2_048;
 pub const MAX_KEY_LENGTH: usize = 256;
@@ -418,6 +428,7 @@ pub struct RequestState {
     pub managed_content_type_header_index: Option<usize>,
     pub content_type_manual_override: bool,
     pub sync_guard: Option<SyncDirection>,
+    pub url_error: Option<String>,
 }
 
 impl fmt::Debug for RequestState {
@@ -452,6 +463,7 @@ impl fmt::Debug for RequestState {
                 &self.content_type_manual_override,
             )
             .field("sync_guard", &self.sync_guard)
+            .field("url_error", &self.url_error)
             .finish()
     }
 }
@@ -482,6 +494,7 @@ impl Default for RequestState {
             managed_content_type_header_index: None,
             content_type_manual_override: false,
             sync_guard: None,
+            url_error: None,
         }
     }
 }
@@ -557,13 +570,16 @@ pub enum SidebarItem {
     HistoryEntry(usize),
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct AppState {
     pub terminal_size: (u16, u16),
     pub layout_mode: LayoutMode,
     pub should_quit: bool,
     pub help_visible: bool,
+    /// Scroll offset for the help modal (in lines).
+    pub help_scroll: usize,
     pub request: RequestState,
+    /// Display state for the *active* response context.
     pub response: ResponseState,
     /// Loaded collections.
     pub collections: Vec<Collection>,
@@ -575,8 +591,38 @@ pub struct AppState {
     pub sidebar_visible: bool,
     /// Whether keyboard focus is inside the sidebar.
     pub sidebar_focused: bool,
+    /// In Small layout mode, whether the response viewer (true) or request builder (false) is shown.
+    pub small_mode_show_response: bool,
     /// Which item is highlighted in the sidebar.
     pub sidebar_selected_item: SidebarItem,
+    /// All currently in-flight requests across all contexts (authoritative source).
+    pub in_flight_requests: HashMap<u64, InFlightRequest>,
+    /// Active notification message and kind (if any).
+    pub notification: Option<(String, NotificationKind)>,
+    /// Remaining ticks before the notification auto-dismisses.
+    pub notification_ticks_remaining: u8,
+}
+
+impl PartialEq for AppState {
+    fn eq(&self, other: &Self) -> bool {
+        self.terminal_size == other.terminal_size
+            && self.layout_mode == other.layout_mode
+            && self.should_quit == other.should_quit
+            && self.help_visible == other.help_visible
+            && self.help_scroll == other.help_scroll
+            && self.request == other.request
+            && self.response == other.response
+            && self.collections == other.collections
+            && self.history == other.history
+            && self.config == other.config
+            && self.sidebar_visible == other.sidebar_visible
+            && self.sidebar_focused == other.sidebar_focused
+            && self.small_mode_show_response == other.small_mode_show_response
+            && self.sidebar_selected_item == other.sidebar_selected_item
+            && self.in_flight_count() == other.in_flight_count()
+            && self.notification == other.notification
+            && self.notification_ticks_remaining == other.notification_ticks_remaining
+    }
 }
 
 impl fmt::Debug for AppState {
@@ -586,12 +632,20 @@ impl fmt::Debug for AppState {
             .field("layout_mode", &self.layout_mode)
             .field("should_quit", &self.should_quit)
             .field("help_visible", &self.help_visible)
+            .field("help_scroll", &self.help_scroll)
             .field("request", &self.request)
             .field("response", &self.response)
             .field("collections_count", &self.collections.len())
             .field("history_count", &self.history.len())
             .field("sidebar_visible", &self.sidebar_visible)
             .field("sidebar_focused", &self.sidebar_focused)
+            .field("small_mode_show_response", &self.small_mode_show_response)
+            .field("in_flight_count", &self.in_flight_count())
+            .field("notification", &self.notification)
+            .field(
+                "notification_ticks_remaining",
+                &self.notification_ticks_remaining,
+            )
             .finish()
     }
 }
@@ -603,6 +657,7 @@ impl AppState {
             layout_mode,
             should_quit: false,
             help_visible: false,
+            help_scroll: 0,
             request: RequestState::default(),
             response: ResponseState::default(),
             collections: Vec::new(),
@@ -610,8 +665,23 @@ impl AppState {
             config: AppConfig::default(),
             sidebar_visible: false,
             sidebar_focused: false,
+            small_mode_show_response: false,
             sidebar_selected_item: SidebarItem::None,
+            in_flight_requests: HashMap::new(),
+            notification: None,
+            notification_ticks_remaining: 0,
         }
+    }
+
+    /// Returns the `InFlightRequest` for the currently-displayed response context, if any.
+    #[allow(dead_code)]
+    pub fn active_in_flight(&self) -> Option<&InFlightRequest> {
+        self.response.in_flight.as_ref()
+    }
+
+    /// How many requests are currently in flight (across all contexts)?
+    pub fn in_flight_count(&self) -> usize {
+        self.in_flight_requests.len()
     }
 }
 

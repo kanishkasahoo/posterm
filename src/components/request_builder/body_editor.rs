@@ -1,8 +1,10 @@
-use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::Text;
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{
+    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+};
+use ratatui::Frame;
 
 use crate::components::request_builder::key_value_editor::render_editor;
 use crate::state::{BodyField, BodyFormat, RequestFocus, RequestState};
@@ -73,6 +75,17 @@ fn render_json(frame: &mut Frame<'_>, area: Rect, request: &RequestState) {
             .borders(Borders::ALL),
     );
     frame.render_widget(paragraph, area);
+
+    // Vertical scrollbar for the JSON body editor.
+    if total_lines > inner_height {
+        let mut sb_state =
+            ScrollbarState::new(total_lines.saturating_sub(inner_height)).position(scroll);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+            area,
+            &mut sb_state,
+        );
+    }
 
     if is_active {
         let (line, col) = cursor_line_col(&request.body_json, request.body_editor.json_cursor);

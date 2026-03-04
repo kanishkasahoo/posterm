@@ -1,7 +1,9 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
+use ratatui::widgets::{
+    Block, Borders, List, ListItem, ListState, Scrollbar, ScrollbarOrientation, ScrollbarState,
+};
 use ratatui::Frame;
 
 use crate::state::{AppState, SidebarItem};
@@ -58,7 +60,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                     Line::from(Span::styled(req_label, req_style))
                 } else {
                     Line::from(vec![
-                        Span::styled(format!("  ● "), req_style),
+                        Span::styled("  ● ".to_string(), req_style),
                         Span::styled(req.method.clone(), method_style),
                         Span::styled(format!(" {}", req.name), req_style),
                     ])
@@ -94,6 +96,19 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     );
 
     frame.render_stateful_widget(list, area, &mut list_state);
+
+    // Vertical scrollbar when the collection list overflows.
+    let total_items = index_map.len();
+    let visible_items = usize::from(area.height.saturating_sub(2));
+    if total_items > visible_items {
+        let mut sb_state = ScrollbarState::new(total_items.saturating_sub(visible_items))
+            .position(selected_flat.unwrap_or(0));
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+            area,
+            &mut sb_state,
+        );
+    }
 }
 
 fn method_color(method: &str) -> Style {

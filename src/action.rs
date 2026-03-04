@@ -77,6 +77,8 @@ pub enum Action {
     PrevSearchMatch,
     ToggleHelp,
     CloseHelp,
+    ScrollHelp(i16),
+    ToggleSmallModePane,
 
     // ── Collections ──────────────────────────────────────────────────────────
     CreateCollection {
@@ -107,7 +109,7 @@ pub enum Action {
     },
 
     // ── History ───────────────────────────────────────────────────────────────
-    RecordHistory(HistoryEntry),
+    RecordHistory(Box<HistoryEntry>),
     LoadFromHistory(usize),
     ClearHistory,
 
@@ -120,4 +122,11 @@ pub enum Action {
 
     // ── Persistence ───────────────────────────────────────────────────────────
     PersistenceError(String),
+
+    // ── Notifications ─────────────────────────────────────────────────────────
+    ShowNotification {
+        message: String,
+        kind: crate::state::NotificationKind,
+    },
+    DismissNotification,
 }

@@ -1,8 +1,8 @@
-use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use ratatui::Frame;
 
 use crate::state::AppState;
 
@@ -56,6 +56,22 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         spans.push(Span::styled(
             if compact { "TRUNC" } else { "TRUNCATED" },
             Style::default().fg(Color::Yellow),
+        ));
+    }
+
+    // Show count of background in-flight requests (those not displayed here).
+    let active_is_in_flight = state.response.in_flight.is_some();
+    let total_in_flight = state.in_flight_count();
+    let bg_count = if active_is_in_flight {
+        total_in_flight.saturating_sub(1)
+    } else {
+        total_in_flight
+    };
+    if bg_count > 0 && !very_compact {
+        spans.push(Span::raw(if compact { " | " } else { "  |  " }));
+        spans.push(Span::styled(
+            format!("+{bg_count} bg"),
+            Style::default().fg(Color::Cyan),
         ));
     }
 
