@@ -50,7 +50,10 @@ const MAX_RELEASE_TAG_LEN: usize = 64;
 // POSTERM_UPDATE_PUBKEY below.
 //
 // Production Ed25519 public key — do NOT replace unless you rotate the signing key.
-const POSTERM_UPDATE_PUBKEY: [u8; 32] = [255, 50, 18, 29, 81, 153, 118, 126, 34, 78, 16, 12, 173, 43, 229, 238, 98, 38, 104, 191, 236, 206, 113, 192, 23, 93, 129, 132, 82, 49, 48, 125];
+const POSTERM_UPDATE_PUBKEY: [u8; 32] = [
+    255, 50, 18, 29, 81, 153, 118, 126, 34, 78, 16, 12, 173, 43, 229, 238, 98, 38, 104, 191, 236,
+    206, 113, 192, 23, 93, 129, 132, 82, 49, 48, 125,
+];
 
 /// Returns `true` when the `POSTERM_SKIP_UPDATE_SIGNATURE_CHECK` environment
 /// variable is set to `"1"`.  This bypass exists **only** for development and
@@ -242,13 +245,13 @@ pub async fn download_release_asset_and_checksum(
         )));
     }
 
-    if let Some(content_length) = archive_response.content_length() {
-        if content_length > MAX_ARCHIVE_BYTES {
-            return Err(UpdateError::Http(format!(
-                "Release archive Content-Length ({content_length} bytes) exceeds the \
-                 {MAX_ARCHIVE_BYTES}-byte safety limit; aborting download"
-            )));
-        }
+    if let Some(content_length) = archive_response.content_length()
+        && content_length > MAX_ARCHIVE_BYTES
+    {
+        return Err(UpdateError::Http(format!(
+            "Release archive Content-Length ({content_length} bytes) exceeds the \
+             {MAX_ARCHIVE_BYTES}-byte safety limit; aborting download"
+        )));
     }
 
     let archive_bytes = archive_response.bytes().await.map_err(|error| {
@@ -278,13 +281,13 @@ pub async fn download_release_asset_and_checksum(
 
     // MEDIUM-NW-1: Reject oversized checksum responses before buffering them.
     // Check Content-Length header if present, then re-check the actual byte length.
-    if let Some(content_length) = checksum_response.content_length() {
-        if content_length > MAX_CHECKSUM_BYTES {
-            return Err(UpdateError::Http(format!(
-                "Checksum Content-Length ({content_length} bytes) exceeds the \
-                 {MAX_CHECKSUM_BYTES}-byte safety limit; aborting download"
-            )));
-        }
+    if let Some(content_length) = checksum_response.content_length()
+        && content_length > MAX_CHECKSUM_BYTES
+    {
+        return Err(UpdateError::Http(format!(
+            "Checksum Content-Length ({content_length} bytes) exceeds the \
+             {MAX_CHECKSUM_BYTES}-byte safety limit; aborting download"
+        )));
     }
 
     let checksum_raw = checksum_response
@@ -834,12 +837,9 @@ fn canonicalize_and_assert_child(
 /// hold the staged binary in a known location; this function stages the copy
 /// into the target directory safely.
 fn replace_executable(staged_path: &Path, target_path: &Path) -> std::io::Result<()> {
-    let parent = target_path.parent().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "Executable path does not have a parent directory",
-        )
-    })?;
+    let parent = target_path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("Executable path does not have a parent directory"))?;
 
     // Use tempfile for an unpredictable name to prevent TOCTOU races.
     let tmp = tempfile::Builder::new()
