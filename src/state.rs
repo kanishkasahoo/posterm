@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::persistence::{AppConfig, Collection, HistoryEntry};
@@ -660,6 +660,8 @@ pub struct AppState {
     pub notification: Option<(String, NotificationKind)>,
     /// Remaining ticks before the notification auto-dismisses.
     pub notification_ticks_remaining: u8,
+    /// Indices of history entries that have been marked for bulk deletion.
+    pub history_marked_indices: HashSet<usize>,
 }
 
 impl PartialEq for AppState {
@@ -685,6 +687,7 @@ impl PartialEq for AppState {
             && self.in_flight_count() == other.in_flight_count()
             && self.notification == other.notification
             && self.notification_ticks_remaining == other.notification_ticks_remaining
+            && self.history_marked_indices == other.history_marked_indices
     }
 }
 
@@ -718,6 +721,7 @@ impl fmt::Debug for AppState {
                 "notification_ticks_remaining",
                 &self.notification_ticks_remaining,
             )
+            .field("history_marked_count", &self.history_marked_indices.len())
             .finish()
     }
 }
@@ -745,6 +749,7 @@ impl AppState {
             in_flight_requests: HashMap::new(),
             notification: None,
             notification_ticks_remaining: 0,
+            history_marked_indices: HashSet::new(),
         }
     }
 

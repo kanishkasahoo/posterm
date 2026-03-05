@@ -113,6 +113,9 @@ pub enum Action {
     RecordHistory(Box<HistoryEntry>),
     LoadFromHistory(usize),
     ClearHistory,
+    DeleteHistoryEntry(usize),
+    DeleteHistoryEntries(Vec<usize>),
+    ToggleHistoryMark(usize),
 
     // ── Sidebar navigation ────────────────────────────────────────────────────
     ToggleSidebar,
