@@ -1,10 +1,10 @@
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::Text;
 use ratatui::widgets::{
     Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
-use ratatui::Frame;
 
 use crate::components::request_builder::key_value_editor::render_editor;
 use crate::state::{BodyField, BodyFormat, RequestFocus, RequestState};

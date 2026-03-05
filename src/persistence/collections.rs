@@ -180,8 +180,8 @@ pub fn delete_collection_file(id: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        delete_collection_file, load_all_collections_from_dir, save_collection, Collection,
-        SavedRequest,
+        Collection, SavedRequest, delete_collection_file, load_all_collections_from_dir,
+        save_collection,
     };
 
     fn temp_collections_dir() -> std::path::PathBuf {
