@@ -1,10 +1,10 @@
-use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{
     Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
+use ratatui::Frame;
 
 use crate::state::AppState;
 
@@ -137,6 +137,7 @@ fn shortcut_lines() -> Vec<Line<'static>> {
         Line::from("Editors"),
         Line::from("  Params/Headers/Form: Ctrl+N add, Ctrl+D remove, Space enable/disable"),
         Line::from("  Params/Headers/Form: Enter switch key/value, arrows/Home/End move cursor"),
+        Line::from("  Body: Left/Right on Format field cycles formats (JSON/Form/Text)"),
     ]
 }
 

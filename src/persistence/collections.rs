@@ -108,6 +108,8 @@ pub struct SavedRequest {
     pub body_format: String,
     pub body_json: String,
     #[serde(default)]
+    pub body_text: String,
+    #[serde(default)]
     pub body_form: Vec<SerializedKeyValueRow>,
 }
 
@@ -126,6 +128,7 @@ impl Default for SavedRequest {
             auth_password: String::new(),
             body_format: String::from("Json"),
             body_json: String::new(),
+            body_text: String::new(),
             body_form: Vec::new(),
         }
     }
@@ -177,8 +180,8 @@ pub fn delete_collection_file(id: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Collection, SavedRequest, delete_collection_file, load_all_collections_from_dir,
-        save_collection,
+        delete_collection_file, load_all_collections_from_dir, save_collection, Collection,
+        SavedRequest,
     };
 
     fn temp_collections_dir() -> std::path::PathBuf {

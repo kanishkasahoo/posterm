@@ -4,6 +4,7 @@ use crate::state::{AuthMode, BodyFormat, HttpMethod, KeyValueRow, ResponseMetada
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BodyContent {
     Json(String),
+    Text(String),
     SetFormRow { index: usize, row: KeyValueRow },
     AddFormRow,
     RemoveFormRow(usize),

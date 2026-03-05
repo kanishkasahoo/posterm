@@ -742,18 +742,25 @@ impl App {
             KeyCode::Left => {
                 if active == BodyField::Format {
                     actions.push(Action::SetBodyFormat(self.state.request.body_format.prev()));
-                } else {
+                } else if active == BodyField::Json {
                     self.state.request.body_editor.json_cursor =
                         self.state.request.body_editor.json_cursor.saturating_sub(1);
+                } else if active == BodyField::Text {
+                    self.state.request.body_editor.text_cursor =
+                        self.state.request.body_editor.text_cursor.saturating_sub(1);
                 }
             }
             KeyCode::Right => {
                 if active == BodyField::Format {
                     actions.push(Action::SetBodyFormat(self.state.request.body_format.next()));
-                } else {
+                } else if active == BodyField::Json {
                     let max = self.state.request.body_json.chars().count();
                     self.state.request.body_editor.json_cursor =
                         (self.state.request.body_editor.json_cursor + 1).min(max);
+                } else if active == BodyField::Text {
+                    let max = self.state.request.body_text.chars().count();
+                    self.state.request.body_editor.text_cursor =
+                        (self.state.request.body_editor.text_cursor + 1).min(max);
                 }
             }
             KeyCode::Home => {
@@ -761,6 +768,10 @@ impl App {
                     let cursor = self.state.request.body_editor.json_cursor;
                     self.state.request.body_editor.json_cursor =
                         line_start_index(&self.state.request.body_json, cursor);
+                } else if active == BodyField::Text {
+                    let cursor = self.state.request.body_editor.text_cursor;
+                    self.state.request.body_editor.text_cursor =
+                        line_start_index(&self.state.request.body_text, cursor);
                 }
             }
             KeyCode::End => {
@@ -768,26 +779,38 @@ impl App {
                     let cursor = self.state.request.body_editor.json_cursor;
                     self.state.request.body_editor.json_cursor =
                         line_end_index(&self.state.request.body_json, cursor);
+                } else if active == BodyField::Text {
+                    let cursor = self.state.request.body_editor.text_cursor;
+                    self.state.request.body_editor.text_cursor =
+                        line_end_index(&self.state.request.body_text, cursor);
                 }
             }
             KeyCode::Enter => {
                 if active == BodyField::Json {
                     self.handle_json_insert_char('\n', &mut actions);
+                } else if active == BodyField::Text {
+                    self.handle_text_insert_char('\n', &mut actions);
                 }
             }
             KeyCode::Backspace => {
                 if active == BodyField::Json {
                     self.handle_json_backspace(&mut actions);
+                } else if active == BodyField::Text {
+                    self.handle_text_backspace(&mut actions);
                 }
             }
             KeyCode::Delete => {
                 if active == BodyField::Json {
                     self.handle_json_delete(&mut actions);
+                } else if active == BodyField::Text {
+                    self.handle_text_delete(&mut actions);
                 }
             }
             KeyCode::Char(ch) if !key_event.modifiers.contains(KeyModifiers::CONTROL) => {
                 if active == BodyField::Json {
                     self.handle_json_insert_char(ch, &mut actions);
+                } else if active == BodyField::Text {
+                    self.handle_text_insert_char(ch, &mut actions);
                 }
             }
             _ => {}
@@ -1296,6 +1319,42 @@ impl App {
         }
     }
 
+    fn handle_text_insert_char(&mut self, ch: char, actions: &mut Vec<Action>) {
+        let cursor = self
+            .state
+            .request
+            .body_editor
+            .text_cursor
+            .min(self.state.request.body_text.chars().count());
+        if self.state.request.body_text.chars().count() >= MAX_BODY_TEXT_LENGTH {
+            return;
+        }
+        let mut updated = self.state.request.body_text.clone();
+        insert_char(&mut updated, cursor, ch);
+        self.state.request.body_editor.text_cursor = cursor + 1;
+        actions.push(Action::SetBodyContent(BodyContent::Text(updated)));
+    }
+
+    fn handle_text_backspace(&mut self, actions: &mut Vec<Action>) {
+        let cursor = self.state.request.body_editor.text_cursor;
+        if cursor == 0 {
+            return;
+        }
+        let mut updated = self.state.request.body_text.clone();
+        remove_char(&mut updated, cursor - 1);
+        self.state.request.body_editor.text_cursor = cursor - 1;
+        actions.push(Action::SetBodyContent(BodyContent::Text(updated)));
+    }
+
+    fn handle_text_delete(&mut self, actions: &mut Vec<Action>) {
+        let cursor = self.state.request.body_editor.text_cursor;
+        let mut updated = self.state.request.body_text.clone();
+        if cursor < updated.chars().count() {
+            remove_char(&mut updated, cursor);
+            actions.push(Action::SetBodyContent(BodyContent::Text(updated)));
+        }
+    }
+
     fn form_editor_field_len(&self, editor: KeyValueEditorState) -> usize {
         let Some(row) = self.state.request.body_form.get(editor.selected_row) else {
             return 0;
@@ -1684,15 +1743,31 @@ impl App {
             Action::SetBodyFormat(format) => {
                 self.state.request.body_format = format;
                 self.state.request.content_type_manual_override = false;
-                if self.state.request.body_editor.active_field == BodyField::Json
-                    && format == BodyFormat::Form
-                {
-                    self.state.request.body_editor.active_field = BodyField::Form;
-                }
-                if self.state.request.body_editor.active_field == BodyField::Form
-                    && format == BodyFormat::Json
-                {
-                    self.state.request.body_editor.active_field = BodyField::Json;
+                match format {
+                    BodyFormat::Json => {
+                        if matches!(
+                            self.state.request.body_editor.active_field,
+                            BodyField::Form | BodyField::Text
+                        ) {
+                            self.state.request.body_editor.active_field = BodyField::Json;
+                        }
+                    }
+                    BodyFormat::Form => {
+                        if matches!(
+                            self.state.request.body_editor.active_field,
+                            BodyField::Json | BodyField::Text
+                        ) {
+                            self.state.request.body_editor.active_field = BodyField::Form;
+                        }
+                    }
+                    BodyFormat::Text => {
+                        if matches!(
+                            self.state.request.body_editor.active_field,
+                            BodyField::Json | BodyField::Form
+                        ) {
+                            self.state.request.body_editor.active_field = BodyField::Text;
+                        }
+                    }
                 }
                 apply_body_content_type_header(&mut self.state.request, true);
                 normalize_body_editor(&mut self.state.request);
@@ -1703,6 +1778,13 @@ impl App {
                         return;
                     }
                     self.state.request.body_json = json;
+                    normalize_body_editor(&mut self.state.request);
+                }
+                BodyContent::Text(text) => {
+                    if text.chars().count() > MAX_BODY_TEXT_LENGTH {
+                        return;
+                    }
+                    self.state.request.body_text = text;
                     normalize_body_editor(&mut self.state.request);
                 }
                 BodyContent::SetFormRow { index, row } => {
@@ -2594,6 +2676,7 @@ fn snapshot_request(req: &crate::state::RequestState, persist_sensitive: bool) -
         },
         body_format: req.body_format.as_str().to_string(),
         body_json: req.body_json.clone(),
+        body_text: req.body_text.clone(),
         body_form: req
             .body_form
             .iter()
@@ -2641,6 +2724,7 @@ fn load_saved_request_into_state(state: &mut crate::state::RequestState, saved: 
     state.auth_password = saved.auth_password.clone();
     state.body_format = body_format_from_str(&saved.body_format);
     state.body_json = saved.body_json.clone();
+    state.body_text = saved.body_text.clone();
     state.body_form = saved
         .body_form
         .iter()
@@ -2678,6 +2762,7 @@ fn auth_mode_from_str(s: &str) -> AuthMode {
 fn body_format_from_str(s: &str) -> BodyFormat {
     match s {
         "Form" => BodyFormat::Form,
+        "Text" => BodyFormat::Text,
         _ => BodyFormat::Json,
     }
 }
@@ -2792,12 +2877,17 @@ fn next_body_field(field: BodyField, format: BodyFormat) -> BodyField {
         BodyFormat::Json => match field {
             BodyField::Format => BodyField::Json,
             BodyField::Json => BodyField::Format,
-            BodyField::Form => BodyField::Format,
+            BodyField::Form | BodyField::Text => BodyField::Format,
         },
         BodyFormat::Form => match field {
             BodyField::Format => BodyField::Form,
             BodyField::Form => BodyField::Format,
-            BodyField::Json => BodyField::Format,
+            BodyField::Json | BodyField::Text => BodyField::Format,
+        },
+        BodyFormat::Text => match field {
+            BodyField::Format => BodyField::Text,
+            BodyField::Text => BodyField::Format,
+            BodyField::Json | BodyField::Form => BodyField::Format,
         },
     }
 }
@@ -2829,23 +2919,44 @@ fn normalize_auth_editor(request: &mut crate::state::RequestState) {
 }
 
 fn normalize_body_editor(request: &mut crate::state::RequestState) {
-    let max_cursor = request.body_json.chars().count();
-    request.body_editor.json_cursor = request.body_editor.json_cursor.min(max_cursor);
+    let max_json_cursor = request.body_json.chars().count();
+    request.body_editor.json_cursor = request.body_editor.json_cursor.min(max_json_cursor);
     normalize_editor_state(&mut request.body_editor.form_editor, &request.body_form);
-    let line_count = request.body_json.split('\n').count().max(1);
-    request.body_editor.json_scroll = request.body_editor.json_scroll.min(line_count - 1);
+    let json_line_count = request.body_json.split('\n').count().max(1);
+    request.body_editor.json_scroll = request.body_editor.json_scroll.min(json_line_count - 1);
+
+    let max_text_cursor = request.body_text.chars().count();
+    request.body_editor.text_cursor = request.body_editor.text_cursor.min(max_text_cursor);
+    let text_line_count = request.body_text.split('\n').count().max(1);
+    request.body_editor.text_scroll = request.body_editor.text_scroll.min(text_line_count - 1);
 
     request.body_editor.active_field = match request.body_format {
         BodyFormat::Json => {
-            if request.body_editor.active_field == BodyField::Form {
+            if matches!(
+                request.body_editor.active_field,
+                BodyField::Form | BodyField::Text
+            ) {
                 BodyField::Json
             } else {
                 request.body_editor.active_field
             }
         }
         BodyFormat::Form => {
-            if request.body_editor.active_field == BodyField::Json {
+            if matches!(
+                request.body_editor.active_field,
+                BodyField::Json | BodyField::Text
+            ) {
                 BodyField::Form
+            } else {
+                request.body_editor.active_field
+            }
+        }
+        BodyFormat::Text => {
+            if matches!(
+                request.body_editor.active_field,
+                BodyField::Json | BodyField::Form
+            ) {
+                BodyField::Text
             } else {
                 request.body_editor.active_field
             }

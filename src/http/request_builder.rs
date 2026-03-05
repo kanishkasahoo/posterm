@@ -155,5 +155,12 @@ fn apply_body(
                 builder.form(&form_pairs)
             }
         }
+        BodyFormat::Text => {
+            if request_state.body_text.trim().is_empty() {
+                builder
+            } else {
+                builder.body(request_state.body_text.clone())
+            }
+        }
     }
 }

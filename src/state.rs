@@ -258,24 +258,34 @@ impl Default for AuthEditorState {
 pub enum BodyFormat {
     Json,
     Form,
+    Text,
 }
 
 impl BodyFormat {
+    #[allow(dead_code)]
+    pub const ALL: [Self; 3] = [Self::Json, Self::Form, Self::Text];
+
     pub fn next(self) -> Self {
         match self {
             Self::Json => Self::Form,
-            Self::Form => Self::Json,
+            Self::Form => Self::Text,
+            Self::Text => Self::Json,
         }
     }
 
     pub fn prev(self) -> Self {
-        self.next()
+        match self {
+            Self::Json => Self::Text,
+            Self::Form => Self::Json,
+            Self::Text => Self::Form,
+        }
     }
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Json => "JSON",
             Self::Form => "Form",
+            Self::Text => "Text",
         }
     }
 
@@ -283,6 +293,7 @@ impl BodyFormat {
         match self {
             Self::Json => "application/json",
             Self::Form => "application/x-www-form-urlencoded",
+            Self::Text => "text/plain",
         }
     }
 }
@@ -292,6 +303,7 @@ pub enum BodyField {
     Format,
     Json,
     Form,
+    Text,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -299,6 +311,8 @@ pub struct BodyEditorState {
     pub active_field: BodyField,
     pub json_cursor: usize,
     pub json_scroll: usize,
+    pub text_cursor: usize,
+    pub text_scroll: usize,
     pub form_editor: KeyValueEditorState,
 }
 
@@ -308,6 +322,8 @@ impl Default for BodyEditorState {
             active_field: BodyField::Format,
             json_cursor: 0,
             json_scroll: 0,
+            text_cursor: 0,
+            text_scroll: 0,
             form_editor: KeyValueEditorState::default(),
         }
     }
@@ -422,6 +438,7 @@ pub struct RequestState {
     pub auth_editor: AuthEditorState,
     pub body_format: BodyFormat,
     pub body_json: String,
+    pub body_text: String,
     pub body_form: Vec<KeyValueRow>,
     pub body_editor: BodyEditorState,
     pub managed_auth_header_index: Option<usize>,
@@ -451,6 +468,7 @@ impl fmt::Debug for RequestState {
             .field("auth_editor", &self.auth_editor)
             .field("body_format", &self.body_format)
             .field("body_json", &self.body_json)
+            .field("body_text", &self.body_text)
             .field("body_form", &self.body_form)
             .field("body_editor", &self.body_editor)
             .field("managed_auth_header_index", &self.managed_auth_header_index)
@@ -488,6 +506,7 @@ impl Default for RequestState {
             auth_editor: AuthEditorState::default(),
             body_format: BodyFormat::Json,
             body_json: String::new(),
+            body_text: String::new(),
             body_form: Vec::new(),
             body_editor: BodyEditorState::default(),
             managed_auth_header_index: None,
