@@ -1,10 +1,10 @@
-use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, List, ListItem, ListState, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
+use ratatui::Frame;
 
 use crate::state::{AppState, SidebarItem};
 
@@ -37,6 +37,8 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 
         let url_display = display_url(&entry.url);
 
+        let is_marked = state.history_marked_indices.contains(&idx);
+
         let base_style = if is_selected && state.sidebar_focused {
             Style::default().fg(Color::Black).bg(Color::White)
         } else if is_selected {
@@ -47,17 +49,25 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
             Style::default().fg(Color::Gray)
         };
 
+        let mark_span = Span::styled(
+            if is_marked { "● " } else { "  " },
+            Style::default().fg(Color::Yellow),
+        );
+
         let line = if is_selected && state.sidebar_focused {
             // When highlighted, render as a single flat span for contrast.
-            Line::from(Span::styled(
+            // Prepend the mark indicator before the content span.
+            let content_span = Span::styled(
                 format!(
                     "{} {} {}  {}",
                     time_str, entry.method, url_display, status_str
                 ),
                 base_style,
-            ))
+            );
+            Line::from(vec![mark_span, content_span])
         } else {
             Line::from(vec![
+                mark_span,
                 Span::styled(
                     format!("{} ", time_str),
                     Style::default().fg(Color::DarkGray),

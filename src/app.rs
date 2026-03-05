@@ -354,7 +354,14 @@ impl App {
                     Action::Render,
                 ]
             }
-            KeyCode::Enter | KeyCode::Char(' ') => vec![Action::SidebarSelect, Action::Render],
+            KeyCode::Enter => vec![Action::SidebarSelect, Action::Render],
+            KeyCode::Char(' ') => {
+                if let SidebarItem::HistoryEntry(idx) = self.state.sidebar_selected_item {
+                    vec![Action::ToggleHistoryMark(idx), Action::Render]
+                } else {
+                    vec![Action::SidebarSelect, Action::Render]
+                }
+            }
             KeyCode::Char('c') if key_event.modifiers.is_empty() => {
                 self.start_sidebar_prompt(SidebarPromptMode::CreateCollection, String::new());
                 vec![Action::Render]
@@ -397,6 +404,35 @@ impl App {
             }
             KeyCode::Char('d') if key_event.modifiers.is_empty() => {
                 self.delete_selected_sidebar_item_actions()
+            }
+            // 'X' (Shift+X) clears all history; match both NONE and SHIFT modifiers since
+            // crossterm may or may not include the SHIFT modifier for uppercase characters.
+            KeyCode::Char('X')
+                if key_event.modifiers.is_empty()
+                    || key_event.modifiers == KeyModifiers::SHIFT =>
+            {
+                if self.state.history.is_empty() {
+                    vec![
+                        Action::ShowNotification {
+                            message: String::from("History is already empty"),
+                            kind: crate::state::NotificationKind::Info,
+                        },
+                        Action::Render,
+                    ]
+                } else {
+                    let count = self.state.history.len();
+                    vec![
+                        Action::ClearHistory,
+                        Action::ShowNotification {
+                            message: format!(
+                                "Cleared all {count} history entr{}",
+                                if count == 1 { "y" } else { "ies" }
+                            ),
+                            kind: crate::state::NotificationKind::Info,
+                        },
+                        Action::Render,
+                    ]
+                }
             }
             _ => Vec::new(),
         }
@@ -2225,7 +2261,72 @@ impl App {
             }
             Action::ClearHistory => {
                 self.state.history.clear();
+                self.state.history_marked_indices.clear();
                 self.persistence.schedule_save(PersistTarget::History);
+            }
+            Action::DeleteHistoryEntry(index) => {
+                if index < self.state.history.len() {
+                    self.state.history.remove(index);
+                    // Shift down all marked indices that were above this index.
+                    self.state.history_marked_indices = self
+                        .state
+                        .history_marked_indices
+                        .iter()
+                        .filter_map(|&i| match i.cmp(&index) {
+                            std::cmp::Ordering::Less => Some(i),
+                            std::cmp::Ordering::Equal => None,
+                            std::cmp::Ordering::Greater => Some(i - 1),
+                        })
+                        .collect();
+                    // Adjust sidebar selection.
+                    let new_len = self.state.history.len();
+                    if let SidebarItem::HistoryEntry(sel) = self.state.sidebar_selected_item {
+                        self.state.sidebar_selected_item = if new_len == 0 {
+                            SidebarItem::None
+                        } else if sel >= new_len {
+                            SidebarItem::HistoryEntry(new_len - 1)
+                        } else {
+                            SidebarItem::HistoryEntry(sel)
+                        };
+                    }
+                    self.persistence.schedule_save(PersistTarget::History);
+                }
+            }
+            Action::DeleteHistoryEntries(indices) => {
+                if indices.is_empty() {
+                    return;
+                }
+                // Sort descending so removals don't shift remaining indices.
+                let mut sorted = indices.clone();
+                sorted.sort_unstable_by(|a, b| b.cmp(a));
+                sorted.dedup();
+                for idx in &sorted {
+                    if *idx < self.state.history.len() {
+                        self.state.history.remove(*idx);
+                    }
+                }
+                self.state.history_marked_indices.clear();
+                // Adjust sidebar selection.
+                let new_len = self.state.history.len();
+                if let SidebarItem::HistoryEntry(sel) = self.state.sidebar_selected_item {
+                    self.state.sidebar_selected_item = if new_len == 0 {
+                        SidebarItem::None
+                    } else if sel >= new_len {
+                        SidebarItem::HistoryEntry(new_len - 1)
+                    } else {
+                        SidebarItem::HistoryEntry(sel)
+                    };
+                }
+                self.persistence.schedule_save(PersistTarget::History);
+            }
+            Action::ToggleHistoryMark(index) => {
+                if index < self.state.history.len() {
+                    if self.state.history_marked_indices.contains(&index) {
+                        self.state.history_marked_indices.remove(&index);
+                    } else {
+                        self.state.history_marked_indices.insert(index);
+                    }
+                }
             }
 
             // ── Sidebar navigation ────────────────────────────────────────────
@@ -2598,9 +2699,47 @@ impl App {
                     Action::Render,
                 ]
             }
-            SidebarItem::HistoryEntry(_) | SidebarItem::None => vec![
+            SidebarItem::HistoryEntry(index) => {
+                // If any entries are marked, delete all marked; otherwise delete this one entry.
+                if !self.state.history_marked_indices.is_empty() {
+                    let indices: Vec<usize> =
+                        self.state.history_marked_indices.iter().copied().collect();
+                    let count = indices.len();
+                    vec![
+                        Action::DeleteHistoryEntries(indices),
+                        Action::ShowNotification {
+                            message: format!(
+                                "Deleted {count} history entr{}",
+                                if count == 1 { "y" } else { "ies" }
+                            ),
+                            kind: crate::state::NotificationKind::Info,
+                        },
+                        Action::Render,
+                    ]
+                } else if self.state.history.get(index).is_some() {
+                    vec![
+                        Action::DeleteHistoryEntry(index),
+                        Action::ShowNotification {
+                            message: String::from("Deleted history entry"),
+                            kind: crate::state::NotificationKind::Info,
+                        },
+                        Action::Render,
+                    ]
+                } else {
+                    vec![
+                        Action::ShowNotification {
+                            message: String::from("History entry no longer exists"),
+                            kind: crate::state::NotificationKind::Error,
+                        },
+                        Action::Render,
+                    ]
+                }
+            }
+            SidebarItem::None => vec![
                 Action::ShowNotification {
-                    message: String::from("Select a collection or saved request to delete"),
+                    message: String::from(
+                        "Select a collection, saved request, or history entry to delete",
+                    ),
                     kind: crate::state::NotificationKind::Error,
                 },
                 Action::Render,
@@ -4196,5 +4335,212 @@ mod tests {
         load_saved_request_into_state(&mut target, &saved);
 
         assert_eq!(target.url_cursor, target.url.chars().count());
+    }
+
+    // ── History deletion tests ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn delete_history_entry_removes_correct_entry() {
+        let mut app = App::new((120, 40));
+        app.state.history = vec![
+            crate::persistence::HistoryEntry {
+                id: String::from("1"),
+                timestamp_secs: 1,
+                method: String::from("GET"),
+                url: String::from("https://a.com"),
+                status_code: Some(200),
+                elapsed_ms: Some(10),
+                request: None,
+            },
+            crate::persistence::HistoryEntry {
+                id: String::from("2"),
+                timestamp_secs: 2,
+                method: String::from("POST"),
+                url: String::from("https://b.com"),
+                status_code: Some(201),
+                elapsed_ms: Some(20),
+                request: None,
+            },
+        ];
+        app.apply_action(Action::DeleteHistoryEntry(0));
+        assert_eq!(app.state.history.len(), 1);
+        assert_eq!(app.state.history[0].id, "2");
+    }
+
+    #[tokio::test]
+    async fn delete_history_entries_removes_all_marked() {
+        let mut app = App::new((120, 40));
+        app.state.history = vec![
+            crate::persistence::HistoryEntry {
+                id: String::from("1"),
+                timestamp_secs: 1,
+                method: String::from("GET"),
+                url: String::from("https://a.com"),
+                status_code: Some(200),
+                elapsed_ms: None,
+                request: None,
+            },
+            crate::persistence::HistoryEntry {
+                id: String::from("2"),
+                timestamp_secs: 2,
+                method: String::from("POST"),
+                url: String::from("https://b.com"),
+                status_code: Some(201),
+                elapsed_ms: None,
+                request: None,
+            },
+            crate::persistence::HistoryEntry {
+                id: String::from("3"),
+                timestamp_secs: 3,
+                method: String::from("PUT"),
+                url: String::from("https://c.com"),
+                status_code: Some(200),
+                elapsed_ms: None,
+                request: None,
+            },
+        ];
+        app.apply_action(Action::DeleteHistoryEntries(vec![0, 2]));
+        assert_eq!(app.state.history.len(), 1);
+        assert_eq!(app.state.history[0].id, "2");
+        assert!(app.state.history_marked_indices.is_empty());
+    }
+
+    #[tokio::test]
+    async fn toggle_history_mark_adds_and_removes() {
+        let mut app = App::new((120, 40));
+        app.state.history = vec![crate::persistence::HistoryEntry {
+            id: String::from("1"),
+            timestamp_secs: 1,
+            method: String::from("GET"),
+            url: String::from("https://a.com"),
+            status_code: Some(200),
+            elapsed_ms: None,
+            request: None,
+        }];
+        app.apply_action(Action::ToggleHistoryMark(0));
+        assert!(app.state.history_marked_indices.contains(&0));
+        app.apply_action(Action::ToggleHistoryMark(0));
+        assert!(!app.state.history_marked_indices.contains(&0));
+    }
+
+    #[tokio::test]
+    async fn clear_history_also_clears_marked_indices() {
+        let mut app = App::new((120, 40));
+        app.state.history = vec![crate::persistence::HistoryEntry {
+            id: String::from("1"),
+            timestamp_secs: 1,
+            method: String::from("GET"),
+            url: String::from("https://a.com"),
+            status_code: Some(200),
+            elapsed_ms: None,
+            request: None,
+        }];
+        app.state.history_marked_indices.insert(0);
+        app.apply_action(Action::ClearHistory);
+        assert!(app.state.history.is_empty());
+        assert!(app.state.history_marked_indices.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sidebar_space_on_history_entry_toggles_mark() {
+        let mut app = App::new((120, 40));
+        app.state.history = vec![crate::persistence::HistoryEntry {
+            id: String::from("1"),
+            timestamp_secs: 1,
+            method: String::from("GET"),
+            url: String::from("https://a.com"),
+            status_code: Some(200),
+            elapsed_ms: None,
+            request: None,
+        }];
+        app.state.sidebar_focused = true;
+        app.state.sidebar_selected_item = SidebarItem::HistoryEntry(0);
+
+        let actions = app.map_key_event_to_actions(KeyEvent::new(
+            KeyCode::Char(' '),
+            KeyModifiers::NONE,
+        ));
+        assert!(actions.contains(&Action::ToggleHistoryMark(0)));
+    }
+
+    #[tokio::test]
+    async fn sidebar_d_on_unmarked_history_entry_deletes_single() {
+        let mut app = App::new((120, 40));
+        app.state.history = vec![crate::persistence::HistoryEntry {
+            id: String::from("1"),
+            timestamp_secs: 1,
+            method: String::from("GET"),
+            url: String::from("https://a.com"),
+            status_code: Some(200),
+            elapsed_ms: None,
+            request: None,
+        }];
+        app.state.sidebar_focused = true;
+        app.state.sidebar_selected_item = SidebarItem::HistoryEntry(0);
+
+        let actions = app.map_key_event_to_actions(KeyEvent::new(
+            KeyCode::Char('d'),
+            KeyModifiers::NONE,
+        ));
+        assert!(actions.contains(&Action::DeleteHistoryEntry(0)));
+    }
+
+    #[tokio::test]
+    async fn sidebar_d_with_marked_entries_deletes_all_marked() {
+        let mut app = App::new((120, 40));
+        app.state.history = vec![
+            crate::persistence::HistoryEntry {
+                id: String::from("1"),
+                timestamp_secs: 1,
+                method: String::from("GET"),
+                url: String::from("https://a.com"),
+                status_code: Some(200),
+                elapsed_ms: None,
+                request: None,
+            },
+            crate::persistence::HistoryEntry {
+                id: String::from("2"),
+                timestamp_secs: 2,
+                method: String::from("POST"),
+                url: String::from("https://b.com"),
+                status_code: Some(201),
+                elapsed_ms: None,
+                request: None,
+            },
+        ];
+        app.state.sidebar_focused = true;
+        app.state.sidebar_selected_item = SidebarItem::HistoryEntry(1);
+        app.state.history_marked_indices.insert(0);
+
+        let actions = app.map_key_event_to_actions(KeyEvent::new(
+            KeyCode::Char('d'),
+            KeyModifiers::NONE,
+        ));
+        // Should dispatch DeleteHistoryEntries with the marked indices.
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::DeleteHistoryEntries(_))));
+    }
+
+    #[tokio::test]
+    async fn sidebar_shift_x_clears_all_history() {
+        let mut app = App::new((120, 40));
+        app.state.history = vec![crate::persistence::HistoryEntry {
+            id: String::from("1"),
+            timestamp_secs: 1,
+            method: String::from("GET"),
+            url: String::from("https://a.com"),
+            status_code: Some(200),
+            elapsed_ms: None,
+            request: None,
+        }];
+        app.state.sidebar_focused = true;
+        app.state.sidebar_selected_item = SidebarItem::HistoryEntry(0);
+
+        let actions = app.map_key_event_to_actions(KeyEvent::new(
+            KeyCode::Char('X'),
+            KeyModifiers::SHIFT,
+        ));
+        assert!(actions.contains(&Action::ClearHistory));
     }
 }
