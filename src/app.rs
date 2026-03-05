@@ -408,8 +408,7 @@ impl App {
             // 'X' (Shift+X) clears all history; match both NONE and SHIFT modifiers since
             // crossterm may or may not include the SHIFT modifier for uppercase characters.
             KeyCode::Char('X')
-                if key_event.modifiers.is_empty()
-                    || key_event.modifiers == KeyModifiers::SHIFT =>
+                if key_event.modifiers.is_empty() || key_event.modifiers == KeyModifiers::SHIFT =>
             {
                 if self.state.history.is_empty() {
                     vec![
@@ -4456,10 +4455,8 @@ mod tests {
         app.state.sidebar_focused = true;
         app.state.sidebar_selected_item = SidebarItem::HistoryEntry(0);
 
-        let actions = app.map_key_event_to_actions(KeyEvent::new(
-            KeyCode::Char(' '),
-            KeyModifiers::NONE,
-        ));
+        let actions =
+            app.map_key_event_to_actions(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
         assert!(actions.contains(&Action::ToggleHistoryMark(0)));
     }
 
@@ -4478,10 +4475,8 @@ mod tests {
         app.state.sidebar_focused = true;
         app.state.sidebar_selected_item = SidebarItem::HistoryEntry(0);
 
-        let actions = app.map_key_event_to_actions(KeyEvent::new(
-            KeyCode::Char('d'),
-            KeyModifiers::NONE,
-        ));
+        let actions =
+            app.map_key_event_to_actions(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
         assert!(actions.contains(&Action::DeleteHistoryEntry(0)));
     }
 
@@ -4512,14 +4507,14 @@ mod tests {
         app.state.sidebar_selected_item = SidebarItem::HistoryEntry(1);
         app.state.history_marked_indices.insert(0);
 
-        let actions = app.map_key_event_to_actions(KeyEvent::new(
-            KeyCode::Char('d'),
-            KeyModifiers::NONE,
-        ));
+        let actions =
+            app.map_key_event_to_actions(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
         // Should dispatch DeleteHistoryEntries with the marked indices.
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, Action::DeleteHistoryEntries(_))));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::DeleteHistoryEntries(_)))
+        );
     }
 
     #[tokio::test]
@@ -4537,10 +4532,8 @@ mod tests {
         app.state.sidebar_focused = true;
         app.state.sidebar_selected_item = SidebarItem::HistoryEntry(0);
 
-        let actions = app.map_key_event_to_actions(KeyEvent::new(
-            KeyCode::Char('X'),
-            KeyModifiers::SHIFT,
-        ));
+        let actions =
+            app.map_key_event_to_actions(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT));
         assert!(actions.contains(&Action::ClearHistory));
     }
 }
