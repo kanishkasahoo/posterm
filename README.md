@@ -77,24 +77,3 @@ posterm stores configuration in a `posterm/` directory under the platform config
 | `history_limit` | `200` | Maximum number of history entries to keep |
 | `follow_redirects` | `true` | Follow HTTP redirects |
 | `persist_sensitive_headers` | `false` | Whether to save sensitive headers to disk |
-
-## Security
-
-**Header redaction.** When `persist_sensitive_headers = false` (the default), sensitive header values (`Authorization`, `Cookie`, `Set-Cookie`, `Proxy-Authorization`) and auth credentials are replaced with `[REDACTED]` in saved history and collection snapshots. Set to `true` to store them as entered.
-
-**Atomic writes.** Config and history files are written via a temp file and atomic rename. On Unix, temp files are created with `0600` permissions before rename.
-
-**Environment variables.**
-
-| Variable | Effect |
-|----------|--------|
-| `POSTERM_ALLOW_INSECURE_TLS=1` | Enables intentionally insecure TLS mode in request execution |
-
-## Release Signing (CI)
-
-The `POSTERM_UPDATE_SIGNING_KEY` repository secret must be set before running the release workflow. It is a base64-encoded raw 32-byte Ed25519 seed.
-
-For exact key generation and public-key extraction commands, see the comment block at the top of `.github/workflows/build-and-package.yml`. In summary:
-
-1. Generate a random 32-byte seed and base64-encode it — store this as the `POSTERM_UPDATE_SIGNING_KEY` repository secret.
-2. Derive the corresponding Ed25519 public key bytes and embed them in `src/updater.rs` as `POSTERM_UPDATE_PUBKEY`.
