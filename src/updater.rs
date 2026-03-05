@@ -242,13 +242,13 @@ pub async fn download_release_asset_and_checksum(
         )));
     }
 
-    if let Some(content_length) = archive_response.content_length() {
-        if content_length > MAX_ARCHIVE_BYTES {
-            return Err(UpdateError::Http(format!(
-                "Release archive Content-Length ({content_length} bytes) exceeds the \
-                 {MAX_ARCHIVE_BYTES}-byte safety limit; aborting download"
-            )));
-        }
+    if let Some(content_length) = archive_response.content_length()
+        && content_length > MAX_ARCHIVE_BYTES
+    {
+        return Err(UpdateError::Http(format!(
+            "Release archive Content-Length ({content_length} bytes) exceeds the \
+             {MAX_ARCHIVE_BYTES}-byte safety limit; aborting download"
+        )));
     }
 
     let archive_bytes = archive_response.bytes().await.map_err(|error| {
@@ -278,13 +278,13 @@ pub async fn download_release_asset_and_checksum(
 
     // MEDIUM-NW-1: Reject oversized checksum responses before buffering them.
     // Check Content-Length header if present, then re-check the actual byte length.
-    if let Some(content_length) = checksum_response.content_length() {
-        if content_length > MAX_CHECKSUM_BYTES {
-            return Err(UpdateError::Http(format!(
-                "Checksum Content-Length ({content_length} bytes) exceeds the \
-                 {MAX_CHECKSUM_BYTES}-byte safety limit; aborting download"
-            )));
-        }
+    if let Some(content_length) = checksum_response.content_length()
+        && content_length > MAX_CHECKSUM_BYTES
+    {
+        return Err(UpdateError::Http(format!(
+            "Checksum Content-Length ({content_length} bytes) exceeds the \
+             {MAX_CHECKSUM_BYTES}-byte safety limit; aborting download"
+        )));
     }
 
     let checksum_raw = checksum_response
@@ -835,8 +835,7 @@ fn canonicalize_and_assert_child(
 /// into the target directory safely.
 fn replace_executable(staged_path: &Path, target_path: &Path) -> std::io::Result<()> {
     let parent = target_path.parent().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
+        std::io::Error::other(
             "Executable path does not have a parent directory",
         )
     })?;

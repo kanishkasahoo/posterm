@@ -225,13 +225,13 @@ async fn run_upgrade() -> i32 {
             )));
         }
 
-        if let Some(len) = response.content_length() {
-            if len > updater::MAX_SIG_BYTES {
-                return Err(updater::UpdateError::Http(format!(
-                    "Signature Content-Length ({len} bytes) exceeds the {}-byte limit",
-                    updater::MAX_SIG_BYTES
-                )));
-            }
+        if let Some(len) = response.content_length()
+            && len > updater::MAX_SIG_BYTES
+        {
+            return Err(updater::UpdateError::Http(format!(
+                "Signature Content-Length ({len} bytes) exceeds the {}-byte limit",
+                updater::MAX_SIG_BYTES
+            )));
         }
 
         let raw = response.bytes().await.map_err(|err| {

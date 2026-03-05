@@ -4094,11 +4094,13 @@ mod tests {
         use super::{load_saved_request_into_state, snapshot_request};
         use crate::state::{HttpMethod, RequestState};
 
-        let mut req = RequestState::default();
-        req.method = HttpMethod::Post;
-        req.url = String::from("https://api.example.com/items");
-        req.body_format = BodyFormat::Json;
-        req.body_json = String::from(r#"{"key":"value"}"#);
+        let req = RequestState {
+            method: HttpMethod::Post,
+            url: String::from("https://api.example.com/items"),
+            body_format: BodyFormat::Json,
+            body_json: String::from(r#"{"key":"value"}"#),
+            ..Default::default()
+        };
 
         let saved = snapshot_request(&req, true);
         assert_eq!(saved.method, "POST");
@@ -4117,24 +4119,26 @@ mod tests {
         use super::snapshot_request;
         use crate::state::{HttpMethod, KeyValueRow, RequestState};
 
-        let mut req = RequestState::default();
-        req.method = HttpMethod::Get;
-        req.url = String::from("https://example.com");
-        req.headers = vec![
-            KeyValueRow {
-                key: String::from("Authorization"),
-                value: String::from("Bearer top-secret"),
-                enabled: true,
-            },
-            KeyValueRow {
-                key: String::from("Accept"),
-                value: String::from("application/json"),
-                enabled: true,
-            },
-        ];
-        req.auth_token = String::from("top-secret");
-        req.auth_username = String::from("admin");
-        req.auth_password = String::from("password");
+        let req = RequestState {
+            method: HttpMethod::Get,
+            url: String::from("https://example.com"),
+            headers: vec![
+                KeyValueRow {
+                    key: String::from("Authorization"),
+                    value: String::from("Bearer top-secret"),
+                    enabled: true,
+                },
+                KeyValueRow {
+                    key: String::from("Accept"),
+                    value: String::from("application/json"),
+                    enabled: true,
+                },
+            ],
+            auth_token: String::from("top-secret"),
+            auth_username: String::from("admin"),
+            auth_password: String::from("password"),
+            ..Default::default()
+        };
 
         let saved = snapshot_request(&req, false);
 
@@ -4157,16 +4161,18 @@ mod tests {
         use super::snapshot_request;
         use crate::state::{AuthMode, HttpMethod, KeyValueRow, RequestState};
 
-        let mut req = RequestState::default();
-        req.method = HttpMethod::Get;
-        req.url = String::from("https://example.com");
-        req.auth_mode = AuthMode::Bearer;
-        req.auth_token = String::from("my-token");
-        req.headers = vec![KeyValueRow {
-            key: String::from("Cookie"),
-            value: String::from("session=abc"),
-            enabled: true,
-        }];
+        let req = RequestState {
+            method: HttpMethod::Get,
+            url: String::from("https://example.com"),
+            auth_mode: AuthMode::Bearer,
+            auth_token: String::from("my-token"),
+            headers: vec![KeyValueRow {
+                key: String::from("Cookie"),
+                value: String::from("session=abc"),
+                enabled: true,
+            }],
+            ..Default::default()
+        };
 
         let saved = snapshot_request(&req, true);
 
@@ -4180,8 +4186,10 @@ mod tests {
         use super::{load_saved_request_into_state, snapshot_request};
         use crate::state::RequestState;
 
-        let mut req = RequestState::default();
-        req.url = String::from("https://example.com/path");
+        let req = RequestState {
+            url: String::from("https://example.com/path"),
+            ..Default::default()
+        };
         let saved = snapshot_request(&req, true);
 
         let mut target = RequestState::default();
