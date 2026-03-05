@@ -2,6 +2,8 @@
 
 posterm is a TUI-based API client for testing HTTP APIs, built with Rust and Ratatui.
 
+<img width="2914" height="1678" alt="image" src="https://github.com/user-attachments/assets/dacda58b-3d19-4c48-8ca7-1543bf26ec33" />
+
 ## Install
 
 ### Script (macOS and Ubuntu — recommended)
