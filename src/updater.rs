@@ -38,29 +38,19 @@ const MAX_RELEASE_TAG_LEN: usize = 64;
 
 // ── Ed25519 signature verification (HIGH-1) ──────────────────────────────────
 //
-// PRODUCTION SETUP:
-//   1. Generate a keypair: `openssl genpkey -algorithm ed25519 -out signing.key`
-//   2. Export the 32-byte raw public key and embed it here as a `[u8; 32]` constant.
-//   3. Replace PLACEHOLDER_ED25519_PUBKEY with the real bytes, or embed them at
-//      build time via a build script that reads the `POSTERM_UPDATE_PUBKEY` env var
-//      (a hex or base64-encoded 32-byte Ed25519 public key).
-//   4. The CI/CD pipeline should sign the extracted binary (not the tarball) with
-//      the corresponding private key, producing a `<asset>.sig` file as a separate
-//      release asset.  The signature covers exactly the bytes that `extract_expected_binary_from_tar`
-//      returns, so the chain of trust is: SHA-256 protects the archive integrity,
-//      and Ed25519 protects the binary authenticity.
-//   5. Remove or set `POSTERM_SKIP_UPDATE_SIGNATURE_CHECK=0` in production.
+// The CI/CD pipeline signs the extracted binary with the corresponding private
+// key, producing a `<asset>.sig` file uploaded as a release asset.  The
+// signature covers exactly the bytes that `extract_expected_binary_from_tar`
+// returns, so the chain of trust is:
+//   SHA-256  → protects archive integrity
+//   Ed25519  → protects binary authenticity
 //
-// PLACEHOLDER: replace with your real 32-byte compressed public key.
-// Example build-script integration:
-//   ```
-//   // build.rs
-//   let raw_hex = std::env::var("POSTERM_UPDATE_PUBKEY").expect("POSTERM_UPDATE_PUBKEY must be set");
-//   let bytes = hex::decode(&raw_hex).expect("POSTERM_UPDATE_PUBKEY must be valid hex");
-//   assert_eq!(bytes.len(), 32, "Ed25519 public key must be 32 bytes");
-//   println!("cargo:rustc-env=POSTERM_UPDATE_PUBKEY_BYTES={raw_hex}");
-//   ```
-const PLACEHOLDER_ED25519_PUBKEY: [u8; 32] = [0u8; 32];
+// To rotate the signing key: generate a new keypair, set POSTERM_UPDATE_SIGNING_KEY
+// in GitHub repo secrets, derive the new public key bytes, and update
+// POSTERM_UPDATE_PUBKEY below.
+//
+// Production Ed25519 public key — do NOT replace unless you rotate the signing key.
+const POSTERM_UPDATE_PUBKEY: [u8; 32] = [255, 50, 18, 29, 81, 153, 118, 126, 34, 78, 16, 12, 173, 43, 229, 238, 98, 38, 104, 191, 236, 206, 113, 192, 23, 93, 129, 132, 82, 49, 48, 125];
 
 /// Returns `true` when the `POSTERM_SKIP_UPDATE_SIGNATURE_CHECK` environment
 /// variable is set to `"1"`.  This bypass exists **only** for development and
@@ -353,9 +343,8 @@ pub fn verify_sha256(archive_bytes: &[u8], checksum_text: &str) -> Result<(), Up
 /// In production:
 ///   - The CI pipeline signs the extracted binary bytes with the private key.
 ///   - The resulting 64-byte signature is uploaded as `<asset_name>.sig`.
-///   - This function verifies that signature against `PLACEHOLDER_ED25519_PUBKEY`.
-///   - Replace `PLACEHOLDER_ED25519_PUBKEY` with the real 32-byte public key before
-///     shipping (see the constant's doc-comment for build-script integration).
+///   - This function verifies that signature against `POSTERM_UPDATE_PUBKEY`.
+///   - Do not replace `POSTERM_UPDATE_PUBKEY` unless you rotate the signing key.
 pub fn verify_ed25519_signature(
     binary_bytes: &[u8],
     signature_bytes: &[u8],
@@ -373,15 +362,7 @@ pub fn verify_ed25519_signature(
         return Ok(());
     }
 
-    // Guard against the placeholder key that was never replaced.
-    if PLACEHOLDER_ED25519_PUBKEY == [0u8; 32] {
-        return Err(UpdateError::Signature(String::from(
-            "Ed25519 public key has not been configured (placeholder key detected). \
-             Set POSTERM_SKIP_UPDATE_SIGNATURE_CHECK=1 to bypass during development.",
-        )));
-    }
-
-    let verifying_key = VerifyingKey::from_bytes(&PLACEHOLDER_ED25519_PUBKEY).map_err(|err| {
+    let verifying_key = VerifyingKey::from_bytes(&POSTERM_UPDATE_PUBKEY).map_err(|err| {
         UpdateError::Signature(format!("Invalid embedded Ed25519 public key: {err}"))
     })?;
 
@@ -1039,22 +1020,18 @@ mod tests {
         );
     }
 
-    // ── HIGH-1: Ed25519 placeholder detection ─────────────────────────────────
+    // ── HIGH-1: Ed25519 signature verification ────────────────────────────────
 
     #[test]
     #[serial_test::serial]
-    fn placeholder_pubkey_is_rejected_without_bypass() {
-        // Safety: test-only, single-threaded; no other thread reads this var concurrently.
-        // We unset before running to ensure a clean state.
-        // SAFETY: test binary is single-threaded at this point.
+    fn wrong_signature_is_rejected() {
         unsafe {
             std::env::remove_var("POSTERM_SKIP_UPDATE_SIGNATURE_CHECK");
         }
-
-        let result = verify_ed25519_signature(b"test", &[0u8; 64]);
+        let result = verify_ed25519_signature(b"test payload", &[0u8; 64]);
         assert!(
             matches!(result, Err(UpdateError::Signature(_))),
-            "placeholder key must be rejected"
+            "a zeroed signature must be rejected by the real key"
         );
     }
 

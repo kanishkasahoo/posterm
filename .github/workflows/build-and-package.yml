@@ -79,8 +79,7 @@ jobs:
 
           secret = os.environ.get("POSTERM_UPDATE_SIGNING_KEY", "").strip()
           if not secret:
-              print("WARNING: POSTERM_UPDATE_SIGNING_KEY is absent — writing empty placeholder .sig file.", flush=True)
-              open(sig_path, "wb").close()
+              print("WARNING: POSTERM_UPDATE_SIGNING_KEY is absent — skipping .sig generation.", flush=True)
               sys.exit(0)
 
           from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -175,8 +174,7 @@ jobs:
 
           secret = os.environ.get("POSTERM_UPDATE_SIGNING_KEY", "").strip()
           if not secret:
-              print("WARNING: POSTERM_UPDATE_SIGNING_KEY is absent — writing empty placeholder .sig file.", flush=True)
-              open(sig_path, "wb").close()
+              print("WARNING: POSTERM_UPDATE_SIGNING_KEY is absent — skipping .sig generation.", flush=True)
               sys.exit(0)
 
           from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -313,7 +311,7 @@ jobs:
           tag_name: ${{ steps.read_version.outputs.version }}
           name: ${{ steps.read_version.outputs.version }}
           target_commitish: ${{ github.sha }}
-          fail_on_unmatched_files: true
+          fail_on_unmatched_files: false
           files: |
             release-assets/ubuntu/${{ env.BINARY_NAME }}-linux.tar.gz
             release-assets/ubuntu/${{ env.BINARY_NAME }}-linux.tar.gz.sha256
