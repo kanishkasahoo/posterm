@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+      - master
+  push:
+    branches:
+      - main
+      - master
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: Rustfmt
+    runs-on: docker
+
+    steps:
+      - name: Checkout source
+        uses: https://data.forgejo.org/actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust with rustfmt
+        run: rustup toolchain install stable --profile minimal --component rustfmt
+
+      - name: Use stable Rust
+        run: rustup default stable
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: docker
+
+    steps:
+      - name: Checkout source
+        uses: https://data.forgejo.org/actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust with clippy
+        run: rustup toolchain install stable --profile minimal --component clippy
+
+      - name: Use stable Rust
+        run: rustup default stable
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  test:
+    name: Test
+    runs-on: docker
+
+    steps:
+      - name: Checkout source
+        uses: https://data.forgejo.org/actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Use stable Rust
+        run: rustup default stable
+
+      - name: Run tests
+        run: cargo test --locked
+
+  ci:
+    name: CI
+    runs-on: docker
+    needs:
+      - fmt
+      - clippy
+      - test
+
+    steps:
+      - name: CI passed
+        run: echo "CI passed"
