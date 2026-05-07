@@ -1,47 +1,32 @@
 name: Build and Package
 
-# ─── Signing key setup ────────────────────────────────────────────────────────
-# POSTERM_UPDATE_SIGNING_KEY must be set as a repository secret.
-# It is a base64-encoded raw 32-byte Ed25519 seed.
-#
-# To generate a new key:
-#   python3 -c "import os, base64; print(base64.b64encode(os.urandom(32)).decode())"
-#
-# The corresponding public key should be embedded in src/updater.rs as
-# POSTERM_UPDATE_PUBKEY.  To extract it after generating the secret:
-#   python3 -c "
-#     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-#     import base64
-#     seed = base64.b64decode('<YOUR_SECRET>')
-#     key  = Ed25519PrivateKey.from_private_bytes(seed)
-#     pub  = key.public_key().public_bytes_raw()
-#     print(list(pub))
-#   "
-# Paste the resulting list into src/updater.rs as:
-#   const POSTERM_UPDATE_PUBKEY: [u8; 32] = [ ... ];
-# ──────────────────────────────────────────────────────────────────────────────
+# POSTERM_UPDATE_SIGNING_KEY may be set as a repository secret.
+# It must be a base64-encoded raw 32-byte Ed25519 seed.
 
 on:
   workflow_dispatch:
-
-permissions:
-  contents: read
 
 env:
   CARGO_TERM_COLOR: always
   BINARY_NAME: posterm
 
 jobs:
-  build-ubuntu:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
+  build-linux:
+    name: Build Linux
+    runs-on: docker
 
     steps:
       - name: Checkout source
-        uses: actions/checkout@v4
+        uses: https://data.forgejo.org/actions/checkout@v4
         with:
           persist-credentials: false
+
+      - name: Read version from Cargo.toml
+        id: read_version
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*= *"\(.*\)"/\1/')
+          echo "version=v${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "RELEASE_VERSION=v${VERSION}" >> "$GITHUB_ENV"
 
       - name: Install stable Rust
         run: rustup toolchain install stable --profile minimal
@@ -66,7 +51,7 @@ jobs:
             | awk '{print $1}' \
             > "dist/${BINARY_NAME}-linux.tar.gz.sha256"
 
-      - name: Sign Linux binary (Ed25519)
+      - name: Sign Linux binary
         env:
           POSTERM_UPDATE_SIGNING_KEY: ${{ secrets.POSTERM_UPDATE_SIGNING_KEY }}
         run: |
@@ -75,22 +60,22 @@ jobs:
 
           binary_name = os.environ["BINARY_NAME"]
           binary_path = f"target/release/{binary_name}"
-          sig_path    = f"dist/{binary_name}-linux.tar.gz.sig"
+          sig_path = f"dist/{binary_name}-linux.tar.gz.sig"
 
           secret = os.environ.get("POSTERM_UPDATE_SIGNING_KEY", "").strip()
           if not secret:
-              print("WARNING: POSTERM_UPDATE_SIGNING_KEY is absent — skipping .sig generation.", flush=True)
+              print("WARNING: POSTERM_UPDATE_SIGNING_KEY is absent; skipping .sig generation.", flush=True)
               sys.exit(0)
 
           from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-          seed    = base64.b64decode(secret)
+          seed = base64.b64decode(secret)
           privkey = Ed25519PrivateKey.from_private_bytes(seed)
 
           with open(binary_path, "rb") as fh:
               payload = fh.read()
 
-          signature = privkey.sign(payload)   # raw 64-byte Ed25519 signature
+          signature = privkey.sign(payload)
 
           with open(sig_path, "wb") as fh:
               fh.write(signature)
@@ -99,226 +84,11 @@ jobs:
           PYEOF
 
       - name: Upload Linux artifacts
-        uses: actions/upload-artifact@v4
+        uses: https://data.forgejo.org/actions/upload-artifact@v4
         with:
-          name: ${{ env.BINARY_NAME }}-ubuntu
+          name: ${{ env.BINARY_NAME }}-linux
           path: |
             dist/${{ env.BINARY_NAME }}-linux.tar.gz
             dist/${{ env.BINARY_NAME }}-linux.tar.gz.sha256
             dist/${{ env.BINARY_NAME }}-linux.tar.gz.sig
           if-no-files-found: warn
-
-  build-macos:
-    runs-on: macos-latest
-    permissions:
-      contents: read
-    outputs:
-      version: ${{ steps.read_version.outputs.version }}
-
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
-      - name: Read version from Cargo.toml
-        id: read_version
-        run: |
-          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*= *"\(.*\)"/\1/')
-          echo "version=v${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "RELEASE_VERSION=v${VERSION}" >> "$GITHUB_ENV"
-
-      - name: Install stable Rust
-        run: rustup toolchain install stable --profile minimal
-
-      - name: Use stable Rust
-        run: rustup default stable
-
-      - name: Run tests
-        run: cargo test --locked
-
-      - name: Build release binary
-        run: cargo build --release --locked
-
-      - name: Package macOS binary and PKG installer
-        run: |
-          mkdir -p dist
-          tar -czf "dist/${BINARY_NAME}-macos.tar.gz" -C target/release "${BINARY_NAME}"
-          rm -rf pkgroot
-          mkdir -p pkgroot/usr/local/bin
-          cp "target/release/${BINARY_NAME}" "pkgroot/usr/local/bin/${BINARY_NAME}"
-          chmod 755 "pkgroot/usr/local/bin/${BINARY_NAME}"
-          pkgbuild \
-            --root pkgroot \
-            --identifier "io.github.posterm.${BINARY_NAME}" \
-            --version "$RELEASE_VERSION" \
-            --install-location "/" \
-            "dist/${BINARY_NAME}-macos.pkg"
-
-      - name: Generate macOS tarball SHA-256 checksum
-        run: |
-          shasum -a 256 "dist/${BINARY_NAME}-macos.tar.gz" \
-            | awk '{print $1}' \
-            > "dist/${BINARY_NAME}-macos.tar.gz.sha256"
-
-      - name: Sign macOS binary (Ed25519)
-        env:
-          POSTERM_UPDATE_SIGNING_KEY: ${{ secrets.POSTERM_UPDATE_SIGNING_KEY }}
-        run: |
-          python3 - <<'PYEOF'
-          import os, sys, base64
-
-          binary_name = os.environ["BINARY_NAME"]
-          binary_path = f"target/release/{binary_name}"
-          sig_path    = f"dist/{binary_name}-macos.tar.gz.sig"
-
-          secret = os.environ.get("POSTERM_UPDATE_SIGNING_KEY", "").strip()
-          if not secret:
-              print("WARNING: POSTERM_UPDATE_SIGNING_KEY is absent — skipping .sig generation.", flush=True)
-              sys.exit(0)
-
-          from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-
-          seed    = base64.b64decode(secret)
-          privkey = Ed25519PrivateKey.from_private_bytes(seed)
-
-          with open(binary_path, "rb") as fh:
-              payload = fh.read()
-
-          signature = privkey.sign(payload)   # raw 64-byte Ed25519 signature
-
-          with open(sig_path, "wb") as fh:
-              fh.write(signature)
-
-          print(f"Ed25519 signature written to {sig_path} ({len(signature)} bytes)", flush=True)
-          PYEOF
-
-      - name: Upload macOS artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.BINARY_NAME }}-macos
-          path: |
-            dist/${{ env.BINARY_NAME }}-macos.tar.gz
-            dist/${{ env.BINARY_NAME }}-macos.pkg
-            dist/${{ env.BINARY_NAME }}-macos.tar.gz.sha256
-            dist/${{ env.BINARY_NAME }}-macos.tar.gz.sig
-          if-no-files-found: warn
-
-  build-windows:
-    runs-on: windows-latest
-    permissions:
-      contents: read
-
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
-      - name: Install stable Rust
-        run: rustup toolchain install stable --profile minimal
-
-      - name: Use stable Rust
-        run: rustup default stable
-
-      - name: Run tests
-        run: cargo test --locked
-
-      - name: Build release binary
-        run: cargo build --release --locked
-
-      - name: Install WiX Toolset
-        shell: pwsh
-        run: |
-          choco install wixtoolset --no-progress -y
-          $wixPath = "${env:ProgramFiles(x86)}\WiX Toolset v3.11\bin"
-          if (Test-Path $wixPath) {
-            $wixPath | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          }
-
-      - name: Build Windows MSI installer
-        shell: pwsh
-        run: |
-          cargo install cargo-wix --locked
-          if (-not (Test-Path "wix\main.wxs")) {
-            cargo wix init
-          }
-          cargo wix --no-build
-          New-Item -ItemType Directory -Path dist -Force | Out-Null
-          Compress-Archive -Path "target\release\${env:BINARY_NAME}.exe" -DestinationPath "dist\${env:BINARY_NAME}-windows.zip" -Force
-          if (-not (Test-Path "target\wix")) {
-            throw "target\\wix was not created by cargo wix"
-          }
-          $msi = Get-ChildItem -Path "target\wix" -Filter "*.msi" -File | Select-Object -First 1
-          if (-not $msi) {
-            throw "MSI file was not generated by cargo wix"
-          }
-          Copy-Item $msi.FullName "dist\${env:BINARY_NAME}-windows.msi"
-
-      - name: Upload Windows artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.BINARY_NAME }}-windows
-          path: |
-            dist/${{ env.BINARY_NAME }}-windows.zip
-            dist/${{ env.BINARY_NAME }}-windows.msi
-          if-no-files-found: error
-
-  release:
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
-    runs-on: ubuntu-latest
-    needs:
-      - build-ubuntu
-      - build-macos
-      - build-windows
-    permissions:
-      contents: write
-
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
-      - name: Read version from Cargo.toml
-        id: read_version
-        run: |
-          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*= *"\(.*\)"/\1/')
-          echo "version=v${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "RELEASE_VERSION=v${VERSION}" >> "$GITHUB_ENV"
-
-      - name: Download Ubuntu artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.BINARY_NAME }}-ubuntu
-          path: release-assets/ubuntu
-
-      - name: Download macOS artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.BINARY_NAME }}-macos
-          path: release-assets/macos
-
-      - name: Download Windows artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.BINARY_NAME }}-windows
-          path: release-assets/windows
-
-      - name: Create GitHub release
-        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b
-        with:
-          tag_name: ${{ steps.read_version.outputs.version }}
-          name: ${{ steps.read_version.outputs.version }}
-          target_commitish: ${{ github.sha }}
-          fail_on_unmatched_files: false
-          files: |
-            release-assets/ubuntu/${{ env.BINARY_NAME }}-linux.tar.gz
-            release-assets/ubuntu/${{ env.BINARY_NAME }}-linux.tar.gz.sha256
-            release-assets/ubuntu/${{ env.BINARY_NAME }}-linux.tar.gz.sig
-            release-assets/macos/${{ env.BINARY_NAME }}-macos.tar.gz
-            release-assets/macos/${{ env.BINARY_NAME }}-macos.tar.gz.sha256
-            release-assets/macos/${{ env.BINARY_NAME }}-macos.tar.gz.sig
-            release-assets/macos/${{ env.BINARY_NAME }}-macos.pkg
-            release-assets/windows/${{ env.BINARY_NAME }}-windows.zip
-            release-assets/windows/${{ env.BINARY_NAME }}-windows.msi

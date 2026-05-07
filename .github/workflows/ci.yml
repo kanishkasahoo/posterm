@@ -10,22 +10,17 @@ on:
       - main
       - master
 
-permissions:
-  contents: read
-
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   fmt:
     name: Rustfmt
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    runs-on: docker
 
     steps:
       - name: Checkout source
-        uses: actions/checkout@v4
+        uses: https://data.forgejo.org/actions/checkout@v4
         with:
           persist-credentials: false
 
@@ -35,20 +30,16 @@ jobs:
       - name: Use stable Rust
         run: rustup default stable
 
-      - uses: Swatinem/rust-cache@v2
-
       - name: Check formatting
         run: cargo fmt --all -- --check
 
   clippy:
     name: Clippy
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    runs-on: docker
 
     steps:
       - name: Checkout source
-        uses: actions/checkout@v4
+        uses: https://data.forgejo.org/actions/checkout@v4
         with:
           persist-credentials: false
 
@@ -58,27 +49,16 @@ jobs:
       - name: Use stable Rust
         run: rustup default stable
 
-      - uses: Swatinem/rust-cache@v2
-
       - name: Run Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
   test:
-    name: Test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    permissions:
-      contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
+    name: Test
+    runs-on: docker
 
     steps:
       - name: Checkout source
-        uses: actions/checkout@v4
+        uses: https://data.forgejo.org/actions/checkout@v4
         with:
           persist-credentials: false
 
@@ -88,14 +68,12 @@ jobs:
       - name: Use stable Rust
         run: rustup default stable
 
-      - uses: Swatinem/rust-cache@v2
-
       - name: Run tests
         run: cargo test --locked
 
   ci:
     name: CI
-    runs-on: ubuntu-latest
+    runs-on: docker
     needs:
       - fmt
       - clippy
