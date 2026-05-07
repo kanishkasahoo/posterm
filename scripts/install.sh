@@ -4,6 +4,8 @@ set -euo pipefail
 
 export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 
+FORGEJO_BASE_URL="https://git.ksahoo.com"
+FORGEJO_API_URL="$FORGEJO_BASE_URL/api/v1"
 REPO="kanishkasahoo/posterm"
 INSTALL_PATH="/usr/local/bin/posterm"
 
@@ -225,6 +227,27 @@ download_file() {
   fi
 }
 
+latest_release_tag() {
+  local out="$1"
+  local api_url json tag
+
+  api_url="$FORGEJO_API_URL/repos/$REPO/releases/latest"
+  if ! download_file "$api_url" "$out"; then
+    err "Failed to query latest release from $api_url"
+    exit 1
+  fi
+
+  json="$(tr -d '\n' <"$out")"
+  tag="$(printf '%s' "$json" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+
+  if [ -z "$tag" ]; then
+    err "Failed to parse latest release tag from Forgejo API response"
+    exit 1
+  fi
+
+  printf '%s\n' "$tag"
+}
+
 install_binary() {
   local src="$1"
   local dst_dir
@@ -265,20 +288,21 @@ main() {
   detect_arch
   detect_platform
 
-  local url checksum_url checksum_name
-  if [ "$version" = "latest" ]; then
-    url="https://github.com/$REPO/releases/latest/download/$ASSET_NAME"
-    checksum_name="$ASSET_NAME.sha256"
-    checksum_url="https://github.com/$REPO/releases/latest/download/$checksum_name"
-  else
-    url="https://github.com/$REPO/releases/download/$version/$ASSET_NAME"
-    checksum_name="$ASSET_NAME.sha256"
-    checksum_url="https://github.com/$REPO/releases/download/$version/$checksum_name"
-  fi
-
   local tmpdir archive_path checksum_path extracted_bin tar_member
   tmpdir="$(mktemp -d)"
   trap 'rm -rf "$tmpdir"' EXIT
+
+  local url checksum_url checksum_name release_tag latest_json_path
+  checksum_name="$ASSET_NAME.sha256"
+  if [ "$version" = "latest" ]; then
+    latest_json_path="$tmpdir/latest-release.json"
+    release_tag="$(latest_release_tag "$latest_json_path")"
+  else
+    release_tag="$version"
+  fi
+
+  url="$FORGEJO_BASE_URL/$REPO/releases/download/$release_tag/$ASSET_NAME"
+  checksum_url="$FORGEJO_BASE_URL/$REPO/releases/download/$release_tag/$checksum_name"
 
   archive_path="$tmpdir/$ASSET_NAME"
   checksum_path="$tmpdir/$checksum_name"

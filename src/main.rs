@@ -148,7 +148,7 @@ async fn run_upgrade() -> i32 {
 
     // ── Step 3: Check latest version ─────────────────────────────────────────
     println!("Checking for updates...");
-    let latest = match updater::check_latest_version_via_github_api(&client).await {
+    let latest = match updater::check_latest_version_via_forgejo_api(&client).await {
         Ok(r) => r,
         Err(err) => {
             eprintln!("error: failed to fetch latest release info: {err}");
@@ -209,7 +209,8 @@ async fn run_upgrade() -> i32 {
     // ── Step 8: Download Ed25519 signature ────────────────────────────────────
     let sig_asset_name = format!("{asset_name}.sig");
     let sig_url = format!(
-        "https://github.com/kanishkasahoo/posterm/releases/download/{}/{sig_asset_name}",
+        "{}/{}/{sig_asset_name}",
+        updater::FORGEJO_DOWNLOAD_PREFIX,
         latest.tag_name
     );
 

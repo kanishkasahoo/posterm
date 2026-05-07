@@ -9,13 +9,13 @@ posterm is a TUI-based API client for testing HTTP APIs, built with Rust and Rat
 ### Script (macOS and Ubuntu — recommended)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kanishkasahoo/posterm/main/scripts/install.sh | bash
+curl -fsSL https://git.ksahoo.com/kanishkasahoo/posterm/raw/branch/main/scripts/install.sh | bash
 ```
 
 To install a specific version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kanishkasahoo/posterm/main/scripts/install.sh | bash -s -- v1.2.3
+curl -fsSL https://git.ksahoo.com/kanishkasahoo/posterm/raw/branch/main/scripts/install.sh | bash -s -- v1.2.3
 ```
 
 Or clone the repo and run directly:
@@ -25,7 +25,7 @@ bash scripts/install.sh
 bash scripts/install.sh v1.2.3   # pin to a version
 ```
 
-The script detects your OS and architecture, downloads the matching release tarball from GitHub Releases, verifies the SHA-256 checksum, and installs the binary to `/usr/local/bin/posterm` (using `sudo` if needed).
+The script detects your OS and architecture, downloads the matching release tarball from Forgejo Releases, verifies the SHA-256 checksum, and installs the binary to `/usr/local/bin/posterm` (using `sudo` if needed).
 
 ### From Releases
 
@@ -49,6 +49,32 @@ cargo build --release
 
 The binary is written to `target/release/posterm`.
 
+To build release binaries for Windows, macOS, and Linux targets:
+
+```bash
+rustup target add \
+  x86_64-pc-windows-gnu \
+  x86_64-apple-darwin \
+  aarch64-apple-darwin \
+  x86_64-unknown-linux-gnu \
+  aarch64-unknown-linux-gnu
+
+cargo build-releases
+```
+
+This runs the equivalent of:
+
+```bash
+cargo build --release \
+  --target x86_64-pc-windows-gnu \
+  --target x86_64-apple-darwin \
+  --target aarch64-apple-darwin \
+  --target x86_64-unknown-linux-gnu \
+  --target aarch64-unknown-linux-gnu
+```
+
+The artifacts are written under `target/<target-triple>/release/`. Cross-compiling may require platform linkers and SDKs beyond the Rust targets.
+
 ## Self-Update
 
 Run `posterm upgrade` from your terminal to check for and apply the latest release:
@@ -57,7 +83,7 @@ Run `posterm upgrade` from your terminal to check for and apply the latest relea
 posterm upgrade
 ```
 
-The upgrade command checks the latest GitHub release, downloads the matching artifact, verifies the SHA-256 checksum and Ed25519 signature, and replaces the running binary in-place. If the installation path requires elevated permissions, the staged binary path is printed for manual copy.
+The upgrade command checks the latest Forgejo release, downloads the matching artifact, verifies the SHA-256 checksum and Ed25519 signature, and replaces the running binary in-place. If the installation path requires elevated permissions, the staged binary path is printed for manual copy.
 
 ## Configuration
 

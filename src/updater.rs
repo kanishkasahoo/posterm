@@ -13,8 +13,10 @@ use tar::Archive;
 
 use crate::persistence::config::config_dir;
 
-const GITHUB_API_URL: &str = "https://api.github.com/repos/kanishkasahoo/posterm/releases/latest";
-const GITHUB_DOWNLOAD_PREFIX: &str = "https://github.com/kanishkasahoo/posterm/releases/download";
+const FORGEJO_API_URL: &str =
+    "https://git.ksahoo.com/api/v1/repos/kanishkasahoo/posterm/releases/latest";
+pub const FORGEJO_DOWNLOAD_PREFIX: &str =
+    "https://git.ksahoo.com/kanishkasahoo/posterm/releases/download";
 const UPDATES_DIR_NAME: &str = "updates";
 const PENDING_METADATA_FILE: &str = "pending-update.json";
 
@@ -46,7 +48,7 @@ const MAX_RELEASE_TAG_LEN: usize = 64;
 //   Ed25519  → protects binary authenticity
 //
 // To rotate the signing key: generate a new keypair, set POSTERM_UPDATE_SIGNING_KEY
-// in GitHub repo secrets, derive the new public key bytes, and update
+// in Forgejo repo secrets, derive the new public key bytes, and update
 // POSTERM_UPDATE_PUBKEY below.
 //
 // Production Ed25519 public key — do NOT replace unless you rotate the signing key.
@@ -145,14 +147,14 @@ pub fn release_asset_for_current_platform() -> Result<&'static str, UpdateError>
     asset_name_for_current_platform()
 }
 
-pub async fn check_latest_version_via_github_api(
+pub async fn check_latest_version_via_forgejo_api(
     client: &reqwest::Client,
 ) -> Result<LatestRelease, UpdateError> {
-    let api_url = Url::parse(GITHUB_API_URL)
-        .map_err(|error| UpdateError::Http(format!("Invalid GitHub API URL: {error}")))?;
+    let api_url = Url::parse(FORGEJO_API_URL)
+        .map_err(|error| UpdateError::Http(format!("Invalid Forgejo API URL: {error}")))?;
 
-    if api_url.host_str() != Some("api.github.com")
-        || api_url.path() != "/repos/kanishkasahoo/posterm/releases/latest"
+    if api_url.host_str() != Some("git.ksahoo.com")
+        || api_url.path() != "/api/v1/repos/kanishkasahoo/posterm/releases/latest"
     {
         return Err(UpdateError::Security(String::from(
             "Refusing to call unexpected update API host/path",
@@ -166,17 +168,17 @@ pub async fn check_latest_version_via_github_api(
 
     if !response.status().is_success() {
         return Err(UpdateError::Http(format!(
-            "GitHub API returned {} while checking latest release",
+            "Forgejo API returned {} while checking latest release",
             response.status()
         )));
     }
 
     let body = response.text().await.map_err(|error| {
-        UpdateError::Http(format!("Failed reading GitHub API response: {error}"))
+        UpdateError::Http(format!("Failed reading Forgejo API response: {error}"))
     })?;
 
     let parsed: LatestReleaseApiResponse = serde_json::from_str(&body).map_err(|error| {
-        UpdateError::Json(format!("Failed to parse GitHub API response: {error}"))
+        UpdateError::Json(format!("Failed to parse Forgejo API response: {error}"))
     })?;
 
     validate_release_tag(&parsed.tag_name)?;
@@ -339,7 +341,7 @@ pub fn verify_sha256(archive_bytes: &[u8], checksum_text: &str) -> Result<(), Up
 ///
 /// HIGH-1: SHA-256 protects archive integrity but not authenticity — an attacker
 /// who can replace both the archive and its accompanying `.sha256` file (e.g. via
-/// a compromised GitHub release or a MITM against the CDN) could deliver a
+/// a compromised release host or a MITM against the CDN) could deliver a
 /// malicious binary.  Ed25519 closes that gap: only the holder of the private
 /// signing key can produce a valid signature.
 ///
@@ -627,11 +629,11 @@ fn validate_release_tag(tag_name: &str) -> Result<(), UpdateError> {
 fn strict_download_url(tag_name: &str, file_name: &str) -> Result<Url, UpdateError> {
     let encoded_tag = tag_name;
     let url = Url::parse(&format!(
-        "{GITHUB_DOWNLOAD_PREFIX}/{encoded_tag}/{file_name}"
+        "{FORGEJO_DOWNLOAD_PREFIX}/{encoded_tag}/{file_name}"
     ))
     .map_err(|error| UpdateError::Http(format!("Failed to build download URL: {error}")))?;
 
-    if url.host_str() != Some("github.com")
+    if url.host_str() != Some("git.ksahoo.com")
         || !url
             .path()
             .starts_with("/kanishkasahoo/posterm/releases/download/")
