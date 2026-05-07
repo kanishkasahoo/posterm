@@ -648,12 +648,28 @@ fn strict_download_url(tag_name: &str, file_name: &str) -> Result<Url, UpdateErr
 
 fn asset_name_for_current_platform() -> Result<&'static str, UpdateError> {
     if cfg!(target_os = "macos") {
-        return Ok("posterm-macos.tar.gz");
+        if cfg!(target_arch = "x86_64") {
+            return Ok("posterm-macos-x86_64.tar.gz");
+        }
+        if cfg!(target_arch = "aarch64") {
+            return Ok("posterm-macos-aarch64.tar.gz");
+        }
+        return Err(UpdateError::UnsupportedPlatform(String::from(
+            "Self-update is supported only on x86_64 and aarch64 macOS",
+        )));
     }
 
     if cfg!(target_os = "linux") {
         if is_ubuntu_linux() {
-            return Ok("posterm-linux.tar.gz");
+            if cfg!(target_arch = "x86_64") {
+                return Ok("posterm-linux-x86_64.tar.gz");
+            }
+            if cfg!(target_arch = "aarch64") {
+                return Ok("posterm-linux-aarch64.tar.gz");
+            }
+            return Err(UpdateError::UnsupportedPlatform(String::from(
+                "Self-update is supported only on x86_64 and aarch64 Ubuntu Linux",
+            )));
         }
         return Err(UpdateError::UnsupportedPlatform(String::from(
             "Self-update is supported on Ubuntu Linux only",

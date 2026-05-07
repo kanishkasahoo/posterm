@@ -33,9 +33,9 @@ Pre-built artifacts are published on the [Releases](../../releases) page for eac
 
 | Platform | Formats |
 |----------|---------|
-| Linux (Ubuntu) | `.tar.gz` |
-| macOS | `.tar.gz`, `.pkg` |
-| Windows | `.zip`, `.msi` |
+| Linux (Ubuntu) | `posterm-linux-x86_64.tar.gz`, `posterm-linux-aarch64.tar.gz` |
+| macOS | `posterm-macos-x86_64.tar.gz`, `posterm-macos-aarch64.tar.gz` |
+| Windows | `posterm-windows-x86_64.zip` |
 
 Download the artifact for your platform, extract or run the installer, and place the binary on your `PATH`.
 
@@ -62,18 +62,19 @@ rustup target add \
 cargo build-releases
 ```
 
-This runs the equivalent of:
+This builds each release target, packages the binaries, and writes checksums to `dist/`:
 
-```bash
-cargo build --release \
-  --target x86_64-pc-windows-gnu \
-  --target x86_64-apple-darwin \
-  --target aarch64-apple-darwin \
-  --target x86_64-unknown-linux-gnu \
-  --target aarch64-unknown-linux-gnu
+```text
+dist/posterm-macos-x86_64.tar.gz
+dist/posterm-macos-aarch64.tar.gz
+dist/posterm-linux-x86_64.tar.gz
+dist/posterm-linux-aarch64.tar.gz
+dist/posterm-windows-x86_64.zip
+dist/*.sha256
+dist/checksums.txt
 ```
 
-The artifacts are written under `target/<target-triple>/release/`. Cross-compiling may require platform linkers and SDKs beyond the Rust targets.
+Upload the files in `dist/` to the release. Cross-compiling may require platform linkers and SDKs beyond the Rust targets.
 
 ## Self-Update
 
@@ -83,7 +84,7 @@ Run `posterm upgrade` from your terminal to check for and apply the latest relea
 posterm upgrade
 ```
 
-The upgrade command checks the latest Forgejo release, downloads the matching artifact, verifies the SHA-256 checksum and Ed25519 signature, and replaces the running binary in-place. If the installation path requires elevated permissions, the staged binary path is printed for manual copy.
+The upgrade command checks the latest Forgejo release, downloads the matching OS/architecture artifact, verifies the SHA-256 checksum and Ed25519 signature, and replaces the running binary in-place. If the installation path requires elevated permissions, the staged binary path is printed for manual copy.
 
 ## Configuration
 

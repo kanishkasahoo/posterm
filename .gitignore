@@ -1,3 +1,5 @@
-.cargo
+/.cargo/*
+!/.cargo/config.toml
 /target
+/dist
 .DS_Store

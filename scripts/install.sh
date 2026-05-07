@@ -165,9 +165,11 @@ detect_arch() {
   case "$machine" in
     x86_64|amd64)
       ARCH="amd64"
+      ASSET_ARCH="x86_64"
       ;;
     arm64|aarch64)
       ARCH="arm64"
+      ASSET_ARCH="aarch64"
       ;;
     *)
       err "Unsupported architecture: $machine. Supported architectures are x86_64/amd64 and arm64/aarch64."
@@ -183,7 +185,7 @@ detect_platform() {
   case "$kernel" in
     Darwin)
       PLATFORM="macos"
-      ASSET_NAME="posterm-macos.tar.gz"
+      ASSET_NAME="posterm-macos-$ASSET_ARCH.tar.gz"
       ;;
     Linux)
       if [ ! -f /etc/os-release ]; then
@@ -204,7 +206,7 @@ detect_platform() {
       fi
 
       PLATFORM="linux"
-      ASSET_NAME="posterm-linux.tar.gz"
+      ASSET_NAME="posterm-linux-$ASSET_ARCH.tar.gz"
       ;;
     *)
       err "Unsupported operating system: $kernel. Supported operating systems are macOS and Ubuntu Linux."

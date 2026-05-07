@@ -6,6 +6,9 @@ description = "A terminal application for Postman-style workflows"
 authors = ["Posterm Contributors"]
 license = "MIT"
 
+[workspace]
+members = [".", "xtask"]
+
 [dev-dependencies]
 serial_test = "3"
 
