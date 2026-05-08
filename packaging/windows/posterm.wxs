@@ -1,0 +1,29 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="posterm"
+    Manufacturer="Posterm Contributors"
+    Version="$(var.Version)"
+    UpgradeCode="{C1D0C796-0B6A-4A39-A52B-3C4FBEF0643D}"
+    Scope="perMachine">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of posterm is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Feature Id="Main" Title="posterm" Level="1">
+      <ComponentGroupRef Id="PostermComponents" />
+    </Feature>
+  </Package>
+
+  <Fragment>
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="posterm" />
+    </StandardDirectory>
+  </Fragment>
+
+  <Fragment>
+    <ComponentGroup Id="PostermComponents" Directory="INSTALLFOLDER">
+      <Component Id="PostermExe">
+        <File Id="PostermExeFile" Source="$(var.BinaryPath)" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+</Wix>

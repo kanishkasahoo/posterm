@@ -56,9 +56,16 @@ const PACKAGES: &[BinaryPackage] = &[
 fn main() -> Result<()> {
     let mut args = env::args().skip(1);
     match args.next().as_deref() {
-        None | Some("build-releases") => build_releases(),
+        None | Some("build-releases") => {
+            eprintln!(
+                "cargo build-releases is deprecated. Use .github/workflows/release.yml on Forgejo."
+            );
+            build_releases()
+        }
         Some("--help") | Some("-h") => {
-            println!("Usage: cargo build-releases");
+            println!(
+                "Usage: cargo run --package xtask -- build-releases\n\nDeprecated: use .github/workflows/release.yml on Forgejo."
+            );
             Ok(())
         }
         Some(other) => Err(format!("unknown xtask command: {other}").into()),

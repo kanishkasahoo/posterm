@@ -1,0 +1,294 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: build ${{ matrix.asset }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: posterm-linux-x86_64.tar.gz
+            deb: posterm-linux-x86_64.deb
+            rpm: posterm-linux-x86_64.rpm
+            binary: posterm
+            archive: tar
+            apt: ""
+            deb_arch: amd64
+            rpm_arch: x86_64
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            asset: posterm-linux-aarch64.tar.gz
+            deb: posterm-linux-aarch64.deb
+            rpm: posterm-linux-aarch64.rpm
+            binary: posterm
+            archive: tar
+            apt: gcc-aarch64-linux-gnu
+            deb_arch: arm64
+            rpm_arch: aarch64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            asset: posterm-macos-x86_64.tar.gz
+            dmg: posterm-macos-x86_64.dmg
+            binary: posterm
+            archive: tar
+            apt: ""
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset: posterm-macos-aarch64.tar.gz
+            dmg: posterm-macos-aarch64.dmg
+            binary: posterm
+            archive: tar
+            apt: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: posterm-windows-x86_64.zip
+            msi: posterm-windows-x86_64.msi
+            binary: posterm.exe
+            archive: zip
+            apt: ""
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux packaging tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm ${{ matrix.apt }}
+
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Package tarball
+        if: matrix.archive == 'tar'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/${{ matrix.binary }}"
+          tar -czf "dist/${{ matrix.asset }}" -C dist "${{ matrix.binary }}"
+          rm "dist/${{ matrix.binary }}"
+
+      - name: Package zip
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/${{ matrix.binary }}"
+          Compress-Archive -Path "dist/${{ matrix.binary }}" -DestinationPath "dist/${{ matrix.asset }}" -Force
+          Remove-Item "dist/${{ matrix.binary }}"
+
+      - name: Build Linux installers
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          binary="target/${{ matrix.target }}/release/${{ matrix.binary }}"
+
+          deb_root="$(mktemp -d)"
+          install -Dm0755 "$binary" "$deb_root/usr/bin/posterm"
+          mkdir -p "$deb_root/DEBIAN"
+          cat > "$deb_root/DEBIAN/control" <<EOF
+          Package: posterm
+          Version: $version
+          Section: utils
+          Priority: optional
+          Architecture: ${{ matrix.deb_arch }}
+          Maintainer: Posterm Contributors
+          Description: Terminal application for Postman-style workflows
+          EOF
+          dpkg-deb --build --root-owner-group "$deb_root" "dist/${{ matrix.deb }}"
+
+          rpm_root="$(mktemp -d)"
+          mkdir -p "$rpm_root/SOURCES"
+          install -m0755 "$binary" "$rpm_root/SOURCES/posterm"
+          spec="$rpm_root/posterm.spec"
+          cat > "$spec" <<EOF
+          Name: posterm
+          Version: $version
+          Release: 1
+          Summary: Terminal application for Postman-style workflows
+          License: MIT
+          AutoReqProv: no
+
+          %description
+          posterm is a TUI-based API client for testing HTTP APIs.
+
+          %prep
+
+          %build
+
+          %install
+          mkdir -p %{buildroot}/usr/bin
+          install -m 0755 %{_sourcedir}/posterm %{buildroot}/usr/bin/posterm
+
+          %files
+          /usr/bin/posterm
+          EOF
+          rpmbuild --define "_topdir $rpm_root/rpmbuild" \
+            --define "_sourcedir $rpm_root/SOURCES" \
+            --target "${{ matrix.rpm_arch }}" \
+            -bb "$spec"
+          cp "$rpm_root/rpmbuild/RPMS/${{ matrix.rpm_arch }}/"*.rpm "dist/${{ matrix.rpm }}"
+
+      - name: Build macOS DMG
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          dmg_root="$(mktemp -d)"
+          install -m 0755 "target/${{ matrix.target }}/release/${{ matrix.binary }}" "$dmg_root/posterm"
+          cp scripts/install.sh "$dmg_root/install.sh"
+          cat > "$dmg_root/README.txt" <<'EOF'
+          posterm macOS installer image
+
+          Run ./install.sh from this mounted image to install posterm to /usr/local/bin/posterm,
+          or copy the posterm binary manually to a directory on your PATH.
+          EOF
+          hdiutil create \
+            -volname "posterm" \
+            -srcfolder "$dmg_root" \
+            -ov \
+            -format UDZO \
+            "dist/${{ matrix.dmg }}"
+
+      - name: Build Windows MSI
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          dotnet tool install --global wix --version 5.*
+          wix build packaging/windows/posterm.wxs `
+            -arch x64 `
+            -d Version=$version `
+            -d BinaryPath="target/${{ matrix.target }}/release/${{ matrix.binary }}" `
+            -out "dist/${{ matrix.msi }}"
+
+      - name: Checksum artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          for artifact in *; do
+            [ -f "$artifact" ] || continue
+            case "$artifact" in
+              *.sha256|*.sig) continue ;;
+            esac
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$artifact" > "$artifact.sha256"
+            else
+              shasum -a 256 "$artifact" > "$artifact.sha256"
+            fi
+          done
+
+      - name: Sign binary bytes
+        shell: bash
+        env:
+          POSTERM_UPDATE_SIGNING_KEY: ${{ secrets.POSTERM_UPDATE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "${POSTERM_UPDATE_SIGNING_KEY:-}" || {
+            echo "POSTERM_UPDATE_SIGNING_KEY secret is required to sign release assets" >&2
+            exit 1
+          }
+          key_file="$(mktemp)"
+          printf '%s' "$POSTERM_UPDATE_SIGNING_KEY" > "$key_file"
+          if [ "${{ matrix.archive }}" = "tar" ]; then
+            work_dir="$(mktemp -d)"
+            tar -xzf "dist/${{ matrix.asset }}" -C "$work_dir"
+            openssl pkeyutl -sign -rawin -inkey "$key_file" \
+              -in "$work_dir/${{ matrix.binary }}" \
+              -out "dist/${{ matrix.asset }}.sig"
+          else
+            work_dir="$(mktemp -d)"
+            unzip -q "dist/${{ matrix.asset }}" -d "$work_dir"
+            openssl pkeyutl -sign -rawin -inkey "$key_file" \
+              -in "$work_dir/${{ matrix.binary }}" \
+              -out "dist/${{ matrix.asset }}.sig"
+          fi
+          rm -f "$key_file"
+
+      - name: Upload build artifact
+        uses: forgejo/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            dist/*
+
+  publish:
+    name: publish Forgejo release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download release artifacts
+        uses: forgejo/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Add installer scripts
+        run: |
+          cp scripts/install.sh dist/posterm-install.sh
+          cp scripts/install.ps1 dist/posterm-install.ps1
+
+      - name: Write aggregate checksums
+        run: |
+          cd dist
+          sha256sum posterm-* > checksums.txt
+
+      - name: Publish assets to Forgejo release
+        env:
+          FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
+          FORGEJO_API_URL: https://git.ksahoo.com/api/v1
+          REPOSITORY: kanishkasahoo/posterm
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          test -n "${FORGEJO_TOKEN:-}" || {
+            echo "FORGEJO_TOKEN secret is required to upload release assets" >&2
+            exit 1
+          }
+
+          release_json="$(curl -sS \
+            -H "Authorization: token $FORGEJO_TOKEN" \
+            "$FORGEJO_API_URL/repos/$REPOSITORY/releases/tags/$TAG_NAME" || true)"
+          release_id="$(printf '%s' "$release_json" | sed -n 's/.*"id":[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)"
+
+          if [ -z "$release_id" ]; then
+            release_json="$(curl -fsS -X POST \
+              -H "Authorization: token $FORGEJO_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"tag_name\":\"$TAG_NAME\",\"name\":\"$TAG_NAME\",\"draft\":false,\"prerelease\":false}" \
+              "$FORGEJO_API_URL/repos/$REPOSITORY/releases")"
+            release_id="$(printf '%s' "$release_json" | sed -n 's/.*"id":[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)"
+          fi
+
+          test -n "$release_id" || {
+            echo "Could not determine Forgejo release id for $TAG_NAME" >&2
+            exit 1
+          }
+
+          for file in dist/*; do
+            [ -f "$file" ] || continue
+            name="$(basename "$file")"
+            curl -fsS -X POST \
+              -H "Authorization: token $FORGEJO_TOKEN" \
+              -F "attachment=@$file" \
+              "$FORGEJO_API_URL/repos/$REPOSITORY/releases/$release_id/assets?name=$name"
+          done

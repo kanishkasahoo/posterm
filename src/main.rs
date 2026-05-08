@@ -180,9 +180,7 @@ async fn run_upgrade() -> i32 {
     // ── Step 5: Download archive + checksum ──────────────────────────────────
     println!("Downloading {}...", latest.tag_name);
     let (archive_bytes, checksum_text) =
-        match updater::download_release_asset_and_checksum(&client, &latest.tag_name, asset_name)
-            .await
-        {
+        match updater::download_release_asset_and_checksum(&client, &latest, asset_name).await {
             Ok(pair) => pair,
             Err(err) => {
                 eprintln!("error: download failed: {err}");
@@ -198,65 +196,24 @@ async fn run_upgrade() -> i32 {
     }
 
     // ── Step 7: Extract binary from archive ───────────────────────────────────
-    let binary_bytes = match updater::extract_expected_binary_from_tar(&archive_bytes, "posterm") {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            eprintln!("error: extraction failed: {err}");
-            return 1;
-        }
-    };
+    let binary_bytes =
+        match updater::extract_expected_binary_from_release_archive(&archive_bytes, asset_name) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                eprintln!("error: extraction failed: {err}");
+                return 1;
+            }
+        };
 
     // ── Step 8: Download Ed25519 signature ────────────────────────────────────
-    let sig_asset_name = format!("{asset_name}.sig");
-    let sig_url = format!(
-        "{}/{}/{sig_asset_name}",
-        updater::FORGEJO_DOWNLOAD_PREFIX,
-        latest.tag_name
-    );
-
-    let sig_bytes: Vec<u8> = match async {
-        let response = client.get(&sig_url).send().await.map_err(|err| {
-            updater::UpdateError::Http(format!("Failed to download signature: {err}"))
-        })?;
-
-        if !response.status().is_success() {
-            return Err(updater::UpdateError::Http(format!(
-                "Signature download failed with status {}",
-                response.status()
-            )));
-        }
-
-        if let Some(len) = response.content_length()
-            && len > updater::MAX_SIG_BYTES
-        {
-            return Err(updater::UpdateError::Http(format!(
-                "Signature Content-Length ({len} bytes) exceeds the {}-byte limit",
-                updater::MAX_SIG_BYTES
-            )));
-        }
-
-        let raw = response.bytes().await.map_err(|err| {
-            updater::UpdateError::Http(format!("Failed to read signature bytes: {err}"))
-        })?;
-
-        if raw.len() as u64 > updater::MAX_SIG_BYTES {
-            return Err(updater::UpdateError::Http(format!(
-                "Signature file ({} bytes) exceeds the {}-byte limit",
-                raw.len(),
-                updater::MAX_SIG_BYTES
-            )));
-        }
-
-        Ok(raw.to_vec())
-    }
-    .await
-    {
-        Ok(b) => b,
-        Err(err) => {
-            eprintln!("error: signature download failed: {err}");
-            return 1;
-        }
-    };
+    let sig_bytes: Vec<u8> =
+        match updater::download_release_signature(&client, &latest, asset_name).await {
+            Ok(b) => b,
+            Err(err) => {
+                eprintln!("error: signature download failed: {err}");
+                return 1;
+            }
+        };
 
     // ── Step 9: Verify Ed25519 signature ─────────────────────────────────────
     if let Err(err) = updater::verify_ed25519_signature(&binary_bytes, &sig_bytes) {

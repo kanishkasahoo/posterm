@@ -10,13 +10,12 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tar::Archive;
+use zip::ZipArchive;
 
 use crate::persistence::config::config_dir;
 
 const FORGEJO_API_URL: &str =
     "https://git.ksahoo.com/api/v1/repos/kanishkasahoo/posterm/releases/latest";
-pub const FORGEJO_DOWNLOAD_PREFIX: &str =
-    "https://git.ksahoo.com/kanishkasahoo/posterm/releases/download";
 const UPDATES_DIR_NAME: &str = "updates";
 const PENDING_METADATA_FILE: &str = "pending-update.json";
 
@@ -79,6 +78,13 @@ fn signature_check_bypassed() -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LatestRelease {
     pub tag_name: String,
+    pub assets: Vec<ReleaseAsset>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseAsset {
+    pub name: String,
+    pub browser_download_url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,6 +141,14 @@ impl std::error::Error for UpdateError {}
 #[derive(Debug, Deserialize)]
 struct LatestReleaseApiResponse {
     tag_name: String,
+    #[serde(default)]
+    assets: Vec<ReleaseAssetApiResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReleaseAssetApiResponse {
+    name: String,
+    browser_download_url: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -182,9 +196,19 @@ pub async fn check_latest_version_via_forgejo_api(
     })?;
 
     validate_release_tag(&parsed.tag_name)?;
+    let mut assets = Vec::with_capacity(parsed.assets.len());
+    for asset in parsed.assets {
+        validate_asset_name(&asset.name)?;
+        strict_release_asset_url(&asset.browser_download_url)?;
+        assets.push(ReleaseAsset {
+            name: asset.name,
+            browser_download_url: asset.browser_download_url,
+        });
+    }
 
     Ok(LatestRelease {
         tag_name: parsed.tag_name,
+        assets,
     })
 }
 
@@ -226,18 +250,19 @@ pub fn check_version_is_upgrade(
 
 pub async fn download_release_asset_and_checksum(
     client: &reqwest::Client,
-    tag_name: &str,
+    release: &LatestRelease,
     asset_name: &str,
 ) -> Result<(Vec<u8>, String), UpdateError> {
-    validate_release_tag(tag_name)?;
+    validate_release_tag(&release.tag_name)?;
 
-    let asset_url = strict_download_url(tag_name, asset_name)?;
-    let checksum_url = strict_download_url(tag_name, &format!("{asset_name}.sha256"))?;
+    let asset_url = release_asset_url(release, asset_name)?;
+    let checksum_url = release_asset_url(release, &format!("{asset_name}.sha256"))?;
 
     // ── Archive download (HIGH-3: check Content-Length before buffering) ──────
     let archive_response = client.get(asset_url).send().await.map_err(|error| {
         UpdateError::Http(format!(
-            "Failed to download release asset for {tag_name}: {error}"
+            "Failed to download release asset for {}: {error}",
+            release.tag_name
         ))
     })?;
     if !archive_response.status().is_success() {
@@ -271,7 +296,8 @@ pub async fn download_release_asset_and_checksum(
     // ── Checksum download ─────────────────────────────────────────────────────
     let checksum_response = client.get(checksum_url).send().await.map_err(|error| {
         UpdateError::Http(format!(
-            "Failed to download checksum file for {tag_name}: {error}"
+            "Failed to download checksum file for {}: {error}",
+            release.tag_name
         ))
     })?;
     if !checksum_response.status().is_success() {
@@ -309,6 +335,47 @@ pub async fn download_release_asset_and_checksum(
     })?;
 
     Ok((archive_bytes.to_vec(), checksum_text))
+}
+
+pub async fn download_release_signature(
+    client: &reqwest::Client,
+    release: &LatestRelease,
+    asset_name: &str,
+) -> Result<Vec<u8>, UpdateError> {
+    let sig_name = format!("{asset_name}.sig");
+    let sig_url = release_asset_url(release, &sig_name)?;
+    let response = client.get(sig_url).send().await.map_err(|err| {
+        UpdateError::Http(format!("Failed to download signature {sig_name}: {err}"))
+    })?;
+
+    if !response.status().is_success() {
+        return Err(UpdateError::Http(format!(
+            "Signature download failed with status {}",
+            response.status()
+        )));
+    }
+
+    if let Some(len) = response.content_length()
+        && len > MAX_SIG_BYTES
+    {
+        return Err(UpdateError::Http(format!(
+            "Signature Content-Length ({len} bytes) exceeds the {MAX_SIG_BYTES}-byte limit"
+        )));
+    }
+
+    let raw = response
+        .bytes()
+        .await
+        .map_err(|err| UpdateError::Http(format!("Failed to read signature bytes: {err}")))?;
+
+    if raw.len() as u64 > MAX_SIG_BYTES {
+        return Err(UpdateError::Http(format!(
+            "Signature file ({} bytes) exceeds the {MAX_SIG_BYTES}-byte limit",
+            raw.len()
+        )));
+    }
+
+    Ok(raw.to_vec())
 }
 
 pub fn verify_sha256(archive_bytes: &[u8], checksum_text: &str) -> Result<(), UpdateError> {
@@ -460,6 +527,88 @@ pub fn extract_expected_binary_from_tar(
             "Archive did not contain expected posterm binary",
         ))
     })
+}
+
+pub fn extract_expected_binary_from_zip(
+    archive_bytes: &[u8],
+    expected_binary_name: &str,
+) -> Result<Vec<u8>, UpdateError> {
+    let cursor = std::io::Cursor::new(archive_bytes);
+    let mut archive = ZipArchive::new(cursor)
+        .map_err(|error| UpdateError::Archive(format!("Failed to inspect zip archive: {error}")))?;
+    let mut selected_contents: Option<Vec<u8>> = None;
+
+    for index in 0..archive.len() {
+        let mut file = archive.by_index(index).map_err(|error| {
+            UpdateError::Archive(format!("Invalid zip entry at index {index}: {error}"))
+        })?;
+
+        let Some(path) = file.enclosed_name().map(|path| path.to_path_buf()) else {
+            return Err(UpdateError::Security(String::from(
+                "Zip archive contained an unsafe path traversal entry",
+            )));
+        };
+        validate_safe_relative_path(&path)?;
+
+        if file.is_dir() {
+            continue;
+        }
+
+        let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+
+        if file_name != expected_binary_name {
+            continue;
+        }
+
+        if selected_contents.is_some() {
+            return Err(UpdateError::Archive(String::from(
+                "Zip archive contains multiple matching posterm binaries",
+            )));
+        }
+
+        if file.size() > MAX_BINARY_BYTES {
+            return Err(UpdateError::Archive(format!(
+                "Binary entry size ({} bytes) exceeds the {MAX_BINARY_BYTES}-byte safety limit",
+                file.size()
+            )));
+        }
+
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents).map_err(|error| {
+            UpdateError::Archive(format!("Failed to read binary data from zip: {error}"))
+        })?;
+        if contents.len() as u64 > MAX_BINARY_BYTES {
+            return Err(UpdateError::Archive(format!(
+                "Extracted binary ({} bytes) exceeds the {MAX_BINARY_BYTES}-byte safety limit",
+                contents.len()
+            )));
+        }
+
+        selected_contents = Some(contents);
+    }
+
+    selected_contents.ok_or_else(|| {
+        UpdateError::Archive(String::from(
+            "Zip archive did not contain expected posterm binary",
+        ))
+    })
+}
+
+pub fn extract_expected_binary_from_release_archive(
+    archive_bytes: &[u8],
+    asset_name: &str,
+) -> Result<Vec<u8>, UpdateError> {
+    if asset_name.ends_with(".tar.gz") {
+        return extract_expected_binary_from_tar(archive_bytes, "posterm");
+    }
+    if asset_name.ends_with(".zip") {
+        return extract_expected_binary_from_zip(archive_bytes, "posterm.exe");
+    }
+    Err(UpdateError::Archive(format!(
+        "Unsupported release archive format: {asset_name}"
+    )))
 }
 
 pub fn stage_file_and_metadata(
@@ -626,13 +775,25 @@ fn validate_release_tag(tag_name: &str) -> Result<(), UpdateError> {
     Ok(())
 }
 
-fn strict_download_url(tag_name: &str, file_name: &str) -> Result<Url, UpdateError> {
-    let encoded_tag = tag_name;
-    let url = Url::parse(&format!(
-        "{FORGEJO_DOWNLOAD_PREFIX}/{encoded_tag}/{file_name}"
-    ))
-    .map_err(|error| UpdateError::Http(format!("Failed to build download URL: {error}")))?;
+fn validate_asset_name(file_name: &str) -> Result<(), UpdateError> {
+    if file_name.is_empty()
+        || file_name.contains('/')
+        || file_name.contains('\\')
+        || file_name.contains("..")
+        || !file_name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+    {
+        return Err(UpdateError::Security(format!(
+            "Release asset has unsupported name: {file_name}"
+        )));
+    }
+    Ok(())
+}
 
+fn strict_release_asset_url(raw_url: &str) -> Result<Url, UpdateError> {
+    let url = Url::parse(raw_url)
+        .map_err(|error| UpdateError::Http(format!("Invalid release asset URL: {error}")))?;
     if url.host_str() != Some("git.ksahoo.com")
         || !url
             .path()
@@ -644,6 +805,22 @@ fn strict_download_url(tag_name: &str, file_name: &str) -> Result<Url, UpdateErr
     }
 
     Ok(url)
+}
+
+fn release_asset_url(release: &LatestRelease, asset_name: &str) -> Result<Url, UpdateError> {
+    validate_asset_name(asset_name)?;
+    let asset = release
+        .assets
+        .iter()
+        .find(|asset| asset.name == asset_name)
+        .ok_or_else(|| {
+            UpdateError::Http(format!(
+                "Latest release {} does not include expected asset {asset_name}",
+                release.tag_name
+            ))
+        })?;
+
+    strict_release_asset_url(&asset.browser_download_url)
 }
 
 fn asset_name_for_current_platform() -> Result<&'static str, UpdateError> {
@@ -676,8 +853,17 @@ fn asset_name_for_current_platform() -> Result<&'static str, UpdateError> {
         )));
     }
 
+    if cfg!(target_os = "windows") {
+        if cfg!(target_arch = "x86_64") {
+            return Ok("posterm-windows-x86_64.zip");
+        }
+        return Err(UpdateError::UnsupportedPlatform(String::from(
+            "Self-update is supported only on x86_64 Windows",
+        )));
+    }
+
     Err(UpdateError::UnsupportedPlatform(String::from(
-        "Self-update is supported only on macOS and Ubuntu Linux",
+        "Self-update is supported only on macOS, Ubuntu Linux, and x86_64 Windows",
     )))
 }
 
@@ -1036,6 +1222,21 @@ mod tests {
             matches!(result, Err(UpdateError::Archive(_))),
             "missing binary should produce Archive error"
         );
+    }
+
+    #[test]
+    fn extract_expected_binary_from_zip_finds_windows_binary() {
+        let cursor = std::io::Cursor::new(Vec::new());
+        let mut zip = zip::ZipWriter::new(cursor);
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("posterm.exe", options).unwrap();
+        use std::io::Write;
+        zip.write_all(b"windows binary").unwrap();
+        let cursor = zip.finish().unwrap();
+
+        let extracted =
+            extract_expected_binary_from_zip(&cursor.into_inner(), "posterm.exe").unwrap();
+        assert_eq!(extracted, b"windows binary");
     }
 
     // ── HIGH-1: Ed25519 signature verification ────────────────────────────────

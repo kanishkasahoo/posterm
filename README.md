@@ -33,9 +33,9 @@ Pre-built artifacts are published on the [Releases](../../releases) page for eac
 
 | Platform | Formats |
 |----------|---------|
-| Linux (Ubuntu) | `posterm-linux-x86_64.tar.gz`, `posterm-linux-aarch64.tar.gz` |
-| macOS | `posterm-macos-x86_64.tar.gz`, `posterm-macos-aarch64.tar.gz` |
-| Windows | `posterm-windows-x86_64.zip` |
+| Linux (Ubuntu) | `posterm-linux-x86_64.tar.gz`, `posterm-linux-aarch64.tar.gz`, `.deb`, `.rpm` |
+| macOS | `posterm-macos-x86_64.tar.gz`, `posterm-macos-aarch64.tar.gz`, `.dmg` |
+| Windows | `posterm-windows-x86_64.zip`, `.msi`, `posterm-install.ps1` |
 
 Download the artifact for your platform, extract or run the installer, and place the binary on your `PATH`.
 
@@ -49,32 +49,34 @@ cargo build --release
 
 The binary is written to `target/release/posterm`.
 
-To build release binaries for Windows, macOS, and Linux targets:
+Release packaging is handled by the Forgejo workflow in `.github/workflows/release.yml`.
+Push a `v*` tag, or run the workflow manually, to build macOS, Linux, and Windows artifacts.
+The old `cargo build-releases` local task is deprecated.
 
-```bash
-rustup target add \
-  x86_64-pc-windows-gnu \
-  x86_64-apple-darwin \
-  aarch64-apple-darwin \
-  x86_64-unknown-linux-gnu \
-  aarch64-unknown-linux-gnu
-
-cargo build-releases
-```
-
-This builds each release target, packages the binaries, and writes checksums to `dist/`:
+The workflow writes these release assets:
 
 ```text
-dist/posterm-macos-x86_64.tar.gz
-dist/posterm-macos-aarch64.tar.gz
-dist/posterm-linux-x86_64.tar.gz
-dist/posterm-linux-aarch64.tar.gz
-dist/posterm-windows-x86_64.zip
-dist/*.sha256
-dist/checksums.txt
+posterm-macos-x86_64.tar.gz
+posterm-macos-aarch64.tar.gz
+posterm-linux-x86_64.tar.gz
+posterm-linux-aarch64.tar.gz
+posterm-windows-x86_64.zip
+posterm-macos-x86_64.dmg
+posterm-macos-aarch64.dmg
+posterm-linux-x86_64.deb
+posterm-linux-aarch64.deb
+posterm-linux-x86_64.rpm
+posterm-linux-aarch64.rpm
+posterm-windows-x86_64.msi
+posterm-install.sh
+posterm-install.ps1
+*.sha256
+*.sig
+checksums.txt
 ```
 
-Upload the files in `dist/` to the release. Cross-compiling may require platform linkers and SDKs beyond the Rust targets.
+Set `FORGEJO_TOKEN` so the publish job can create/upload release assets, and
+`POSTERM_UPDATE_SIGNING_KEY` to the Ed25519 private key PEM used by `posterm upgrade`.
 
 ## Self-Update
 
@@ -84,7 +86,7 @@ Run `posterm upgrade` from your terminal to check for and apply the latest relea
 posterm upgrade
 ```
 
-The upgrade command checks the latest Forgejo release, downloads the matching OS/architecture artifact, verifies the SHA-256 checksum and Ed25519 signature, and replaces the running binary in-place. If the installation path requires elevated permissions, the staged binary path is printed for manual copy.
+The upgrade command checks the latest Forgejo release API response, downloads the matching OS/architecture asset from that release, verifies the SHA-256 checksum and Ed25519 signature, and replaces the running binary in-place. If the installation path requires elevated permissions, the staged binary path is printed for manual copy.
 
 ## Configuration
 
